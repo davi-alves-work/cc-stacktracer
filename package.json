@@ -1,0 +1,160 @@
+{
+  "name": "cc-stacktracer",
+  "version": "2.0.0",
+  "description": "Observability SDK for Node.js — captures errors, structured logs, distributed traces and database spans, and ships them to a CC StackTracer ingestion API.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "docs/client-installation-integration-playbook.md",
+    "docs/client-payload-quality-checklist.md",
+    "docs/client-node-tgz-installation.md",
+    "docs/client-generic-http-node.md",
+    "docs/client-universal-https-ingestion.md",
+    "docs/client-onboarding-troubleshooting.md",
+    "docs/client-distributed-tracing.md",
+    "cursor-rules"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./fastify": {
+      "types": "./dist/integrations/fastify.d.ts",
+      "import": "./dist/integrations/fastify.js",
+      "default": "./dist/integrations/fastify.js"
+    },
+    "./express": {
+      "types": "./dist/integrations/express.d.ts",
+      "import": "./dist/integrations/express.js",
+      "default": "./dist/integrations/express.js"
+    },
+    "./adonis": {
+      "types": "./dist/integrations/adonis.d.ts",
+      "import": "./dist/integrations/adonis.js",
+      "default": "./dist/integrations/adonis.js"
+    },
+    "./generic-http": {
+      "types": "./dist/generic-http/index.d.ts",
+      "import": "./dist/generic-http/index.js",
+      "default": "./dist/generic-http/index.js"
+    },
+    "./db-prisma": {
+      "types": "./dist/db/prisma.d.ts",
+      "import": "./dist/db/prisma.js",
+      "default": "./dist/db/prisma.js"
+    },
+    "./db-lucid": {
+      "types": "./dist/db/lucid.d.ts",
+      "import": "./dist/db/lucid.js",
+      "default": "./dist/db/lucid.js"
+    },
+    "./plugin-sdk": {
+      "types": "./dist/plugin-sdk.d.ts",
+      "import": "./dist/plugin-sdk.js",
+      "default": "./dist/plugin-sdk.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "build:client": "tsc -p tsconfig.build.json",
+    "pack:client": "npm run build:client && npm pack",
+    "pack:client:dry": "npm run build:client && npm pack --dry-run",
+    "test": "vitest run",
+    "lint": "eslint \"src/**/*.ts\"",
+    "format": "prettier --write \"src/**/*.ts\" \"*.{md,json}\" \"docs/**/*.md\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "observability",
+    "apm",
+    "tracing",
+    "distributed-tracing",
+    "opentelemetry",
+    "spans",
+    "telemetry",
+    "error-tracking",
+    "error-monitoring",
+    "logging",
+    "structured-logging",
+    "stacktrace",
+    "monitoring",
+    "nodejs",
+    "typescript",
+    "fastify",
+    "express",
+    "adonisjs",
+    "prisma",
+    "clickhouse"
+  ],
+  "peerDependencies": {
+    "@adonisjs/core": ">=6.0.0",
+    "@adonisjs/lucid": ">=20.0.0",
+    "@prisma/client": ">=5.0.0",
+    "express": ">=4.0.0 || >=5.0.0",
+    "fastify": ">=4.0.0",
+    "fastify-plugin": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@adonisjs/core": {
+      "optional": true
+    },
+    "@adonisjs/lucid": {
+      "optional": true
+    },
+    "@prisma/client": {
+      "optional": true
+    },
+    "express": {
+      "optional": true
+    },
+    "fastify": {
+      "optional": true
+    },
+    "fastify-plugin": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.10.0",
+    "@types/supertest": "^7.2.0",
+    "eslint": "^10.1.0",
+    "express": "^5.2.1",
+    "fastify": "^5.8.5",
+    "fastify-plugin": "^5.1.0",
+    "prettier": "3.8.1",
+    "supertest": "^7.2.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.57.1",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/davi-alves-work/cc-stacktracer.git"
+  },
+  "author": "Davi Alves",
+  "bugs": {
+    "url": "https://github.com/davi-alves-work/cc-stacktracer/issues"
+  },
+  "homepage": "https://github.com/davi-alves-work/cc-stacktracer#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}

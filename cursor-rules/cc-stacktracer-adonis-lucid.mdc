@@ -1,0 +1,362 @@
+---
+alwaysApply: false
+version: 0.4.1
+lastUpdated: 2026-04-29
+ruleset: cc-stacktracer-adonis-lucid
+extends: cc-stacktracer-core.mdc
+---
+
+# CC StackTracer Rules - AdonisJS + Lucid
+
+Rules for AdonisJS clients using Lucid ORM and optional raw SQL.
+
+---
+
+## 1) Bootstrap and Lifecycle
+
+Recommended order:
+
+1. Load and validate env vars.
+2. Initialize app/server lifecycle.
+3. Register correlation middleware before request telemetry.
+4. Initialize `StackTrace.init(...)` or `StackTrace.auto(...)`.
+5. Register Adonis HTTP telemetry middleware/hooks.
+6. Register centralized exception capture.
+7. Create/instrument Lucid/Database access.
+8. Start serving requests.
+9. Flush telemetry on shutdown.
+
+Rules:
+
+- initialize StackTrace exactly once
+- do not initialize inside controllers/services
+- do not register duplicate monitor transports
+- keep SDK disabled/no-op when `STACKTRACE_API_KEY` is absent
+- call `StackTrace.shutdown()` during app termination where the lifecycle allows it
+
+---
+
+## 2) Required StackTrace Options
+
+Use the core config rules.
+
+Recommended init options:
+
+```ts
+StackTrace.init({
+  apiKey: process.env.STACKTRACE_API_KEY!,
+  endpoint: process.env.STACKTRACE_ENDPOINT!,
+  serviceId: process.env.STACKTRACE_SERVICE_ID!,
+  sendMode: 'batch',
+  flushIntervalMs: 5000,
+  maxBatchSize: 50,
+  enableGlobalHandlers: true,
+  beforeSend,
+  onTransportError,
+});
+```
+
+Client env files should follow the dashboard `/integrations` page source of truth: `STACKTRACE_API_KEY`, `STACKTRACE_ENDPOINT`, and `STACKTRACE_SERVICE_ID`. The API key identifies project and tenant automatically; do not add service/environment, tenant, or project env requirements in new client templates.
+
+---
+
+## 3) Adonis HTTP Correlation
+
+Create a global middleware that runs before telemetry and controllers.
+
+It should:
+
+- read `x-request-id`
+- read W3C `traceparent`
+- generate missing values
+- make generated values visible to downstream telemetry
+- echo them in response headers
+- expose a normalized route label when available
+
+Route label priority:
+
+1. Adonis route pattern/name when available
+2. controller/action name when useful
+3. fallback `METHOD /masked/path/:id`
+
+Do not group by raw URL with query strings.
+
+---
+
+## 4) Adonis HTTP Telemetry
+
+Use the official SDK Adonis integration when it produces reliable request events and HTTP spans for the app version.
+
+If a custom middleware is needed, it must:
+
+- start timing before `await next()`
+- catch/rethrow errors so Adonis semantics are preserved
+- record final response status after `await next()`
+- compute integer non-negative duration
+- emit one request event
+- emit one root HTTP span
+- make the request event `trace.span_id` equal the root HTTP span `span_id`
+- preserve trace context for child DB/business spans
+
+Recommended span fields:
+
+- `span_type: "http"`
+- `parent_span_id`: `null` for a trace origin, or the inbound `traceparent` parent id for a downstream service
+- `span_name: "METHOD route"`
+- `http_method`
+- `http_route`
+- `http_status_code`
+- `duration_us` (microseconds — v4 replaced `duration_ms`)
+- `status: "error"` for 5xx, otherwise `"ok"` (v4 replaced the `is_error` boolean)
+
+**Outbound (distributed tracing, opt-in):** to make this service's outbound HTTP
+calls join the same trace, enable `StackTrace.auto({ outboundHttp: { instrumentNodeHttp: true, instrumentFetch: true } })`.
+`instrumentNodeHttp` covers axios/got/follow-redirects on Node. See core rules §8 and
+`docs/client-distributed-tracing.md`.
+
+Use capture policy checks when available before enqueuing request telemetry.
+
+Filter noise such as health checks intentionally in `beforeSend` or the middleware.
+
+DB, business, service, and external spans created during a request must inherit
+the active trace context and set `parent_span_id` to the active parent span,
+normally the HTTP root span. Spans created during HTTP requests without parents
+are orphaned telemetry and should be treated as an implementation bug.
+
+---
+
+## 5) `beforeSend` Rules
+
+Use `beforeSend` to normalize and enrich SDK events.
+
+Recommended:
+
+- ensure `context.http.method`
+- ensure `context.http.url`
+- ensure `context.http.route`
+- ensure `context.http.status_code`
+- ensure `context.http.duration_ms`
+- drop `/health` or uptime endpoints when desired
+- fold app monitor HTTP context into `context.http` for captured errors
+
+Do not build full canonical v4 events manually in `beforeSend`.
+
+---
+
+## 6) Lucid Instrumentation Strategy
+
+Prefer clarity over maximum automatic coverage.
+
+Use one of:
+
+- repository/service-level `runQuery` wrappers for critical operations
+- centralized Lucid/Database query instrumentation when the app version supports it reliably
+- a hybrid: centralized coverage for common operations plus explicit wrappers for business-critical flows
+
+Naming:
+
+- `user.findByEmail`
+- `invoice.listByPeriod`
+- `payroll.recibo.listByMatricula`
+- `auth.login`
+
+Metadata:
+
+- `table`
+- `sqlVerb`
+- safe datastore label when needed
+- business operation identifier when safe
+
+Use the real engine as `db.system`:
+
+- `postgres`
+- `mysql`
+- `sqlserver`
+- `sqlite`
+
+Do not use labels like `lucid`, `tenant-db`, or `acesso` as `db.system`.
+
+---
+
+## 7) Raw SQL in Adonis/Lucid
+
+All raw SQL must be parameterized.
+
+Rules:
+
+- prefer bindings over interpolation
+- wrap important raw SQL in `runQuery`
+- extract table and SQL verb when possible
+- do not send full SQL text in telemetry; emit only table/object, operation, duration, status, and sanitized error metadata
+- ban unsafe raw execution with untrusted input
+
+Recommended wrapper shape:
+
+```ts
+await StackTrace.runQuery(
+  'postgres',
+  'reports.monthlyPayroll',
+  () => {
+    return db.rawQuery(sqlText, bindings);
+  },
+  {
+    table: 'payroll',
+    sqlVerb: 'SELECT',
+  },
+);
+```
+
+If raw SQL is generated dynamically, the code must prove untrusted values are passed as bindings, not concatenated into SQL.
+
+---
+
+## 8) Error Handling in Adonis
+
+Capture exceptions in one centralized exception flow.
+
+Recommended flow:
+
+1. Controllers/services throw.
+2. Adonis exception handler maps user-facing response.
+3. Internal monitor builds safe context.
+4. cc-stacktracer transport calls `StackTrace.captureException`.
+
+Context should include:
+
+- error ID
+- internal code
+- route label
+- method
+- status
+- duration
+- correlation fields
+- safe tenant/user identifiers
+- safe DB metadata
+
+Rules:
+
+- preserve original errors internally
+- never expose stack traces to users
+- never expose SQL, table, column, or driver messages to users
+- avoid duplicate captures unless intentional
+- document known duplicate paths, such as DB failure plus HTTP boundary capture
+- sanitize nested metadata before forwarding
+
+---
+
+## 9) User Context in Adonis
+
+Because SDK user scope is global, request apps must handle cleanup.
+
+Rules:
+
+- call `StackTrace.setUser(...)` only after auth succeeds
+- set only safe identifiers
+- clear user context after the response or in middleware `finally`
+- do not use per-request tags
+- use static tags only at startup
+
+Example pattern:
+
+```ts
+try {
+  StackTrace.setUser({ id: user.id, tenantId: tenant.id });
+  await next();
+} finally {
+  StackTrace.clearUser();
+}
+```
+
+If the SDK later uses request-local user context, update this rule, but keep cleanup explicit.
+
+---
+
+## 10) Business Context and Business Spans
+
+Use `withBusinessContextAsync` for domain operations:
+
+- login
+- invitation acceptance
+- payroll query
+- document generation
+- configuration changes
+
+Use `withSpan` for expensive non-DB work:
+
+- PDF generation
+- file exports
+- external HTTP calls
+- queue jobs
+
+Inside a business span, use `logStructured` sparingly for useful breadcrumbs. Do not replace spans with success logs for latency modeling.
+
+---
+
+## 11) Payload and Span Quality Gates
+
+Verify before considering an Adonis/Lucid integration complete:
+
+- SDK initializes once
+- endpoint is base URL only
+- events go to `/v1/events`
+- spans go to `/v1/spans`
+- request events include normalized route
+- HTTP spans have final status and integer duration
+- request events link to HTTP root spans through `trace.span_id`
+- DB spans use real `db.system`
+- raw SQL spans include table/verb when available
+- trace context connects HTTP root span to DB/business child spans
+- DB/business child spans have `parent_span_id`
+- sensitive data is absent from payload samples
+- shutdown flushes queues
+
+---
+
+## 12) Troubleshooting by Symptom
+
+### Request events arrive but HTTP spans do not
+
+1. Verify the HTTP middleware creates trace context.
+2. Verify response status/duration are available after `await next()`.
+3. Verify capture policy did not suppress the request.
+4. Verify `/v1/spans` accepts API-key project/tenant scope.
+5. Verify the request event `trace.span_id` matches the HTTP root span.
+
+### Lucid queries execute but DB spans are missing
+
+1. Verify repository wrappers or centralized instrumentation are actually used.
+2. Verify DB work runs inside the request trace context.
+3. Verify `runQuery` is not called after context is lost.
+4. Verify capture policy allows DB spans.
+5. Verify DB spans have `parent_span_id` during HTTP requests.
+
+### User data leaks between requests
+
+1. Verify `clearUser()` runs in middleware `finally`.
+2. Remove per-request tags.
+3. Keep only static deploy/app tags.
+
+### Raw SQL spans have poor grouping
+
+1. Add explicit operation names.
+2. Add table and SQL verb metadata.
+3. Mask dynamic path/input values.
+4. Avoid using raw SQL text as the operation name.
+
+---
+
+## 13) Minimum Acceptance Checklist
+
+- correlation middleware runs before telemetry
+- `x-request-id` and `traceparent` generated/propagated
+- request event emitted
+- HTTP root span emitted
+- request event `trace.span_id` matches the HTTP root span `span_id`
+- DB/business/external spans have `parent_span_id` during requests
+- exception handler captures once through monitor transport
+- Lucid or repository DB operations wrapped with `runQuery`
+- raw SQL parameterized and instrumented
+- user context set after auth and cleared after response
+- business spans cover expensive non-DB work
+- dev verification proves `/v1/events` and `/v1/spans`
+- no sensitive data appears in samples

@@ -1,0 +1,473 @@
+---
+alwaysApply: false
+version: 0.4.1
+lastUpdated: 2026-04-29
+ruleset: cc-stacktracer-fastify-prisma
+extends: cc-stacktracer-core.mdc
+---
+
+# CC StackTracer Rules - Fastify + Prisma
+
+Rules for Node.js clients using Fastify, Prisma 6+, and optional raw SQL drivers.
+
+---
+
+## 1) Bootstrap Order
+
+Required order:
+
+1. Load and validate env vars.
+2. Create the Fastify instance.
+3. Register base Fastify plugins: CORS, helmet, rate limit, JWT/cookie when used.
+4. Register request start-time tracking if the app error monitor needs duration.
+5. Register StackTrace correlation plugin first.
+6. Initialize StackTrace.
+7. Register Fastify HTTP telemetry plugin/hook.
+8. Create Prisma clients through the instrumented factory.
+9. Register application routes.
+10. Start `listen`.
+11. On close, call `StackTrace.shutdown()`.
+
+Do not register routes before correlation and telemetry are ready.
+
+Reference shape:
+
+```ts
+const app = createApp();
+await app.register(correlationPlugin);
+await setupStackTrace(app);
+await registerRoutes(app);
+await app.listen({ host, port });
+```
+
+If `STACKTRACE_API_KEY` is absent, `setupStackTrace` should return without registering telemetry transports, and the app must still boot normally.
+
+---
+
+## 2) Fastify Correlation Plugin
+
+Create a small app-owned plugin that runs before StackTrace HTTP telemetry.
+
+It should:
+
+- read existing `x-request-id`
+- read existing W3C `traceparent`
+- generate missing `x-request-id`
+- generate missing `traceparent`
+- write generated values back into request headers before telemetry runs
+- echo `x-request-id` and `traceparent` in response headers
+- expose a helper for route labels used by monitor/error code
+
+Route label priority:
+
+1. Fastify template route, such as `/api/users/:id`
+2. route options URL
+3. fallback `METHOD /masked/path/:id`
+
+The fallback must mask numeric IDs, UUIDs, and long hex identifiers.
+
+Do not use raw full URLs with query strings as grouping keys.
+
+---
+
+## 3) Fastify HTTP Telemetry
+
+Preferred default:
+
+- use the official SDK Fastify integration if it works reliably for the client framework/runtime combination
+
+Accepted fallback:
+
+- use an app-owned Fastify plugin based on SDK/plugin APIs
+- collect final status and duration in `onResponse`
+- use `onError` only to keep request snapshot/status updated
+
+For Fastify 5, prefer `onResponse` when `onSend` is not reliable for encapsulated routes or all response paths.
+
+HTTP telemetry must emit:
+
+- one request event
+- one root HTTP span per captured request
+- the request event and root HTTP span must share `trace_id`
+- the request event `trace.span_id` must equal the root HTTP span `span_id`
+
+The HTTP root span should include:
+
+- `span_type: "http"`
+- `parent_span_id`: `null` for a trace origin, or the inbound `traceparent` parent id for a downstream service
+- `span_name: "METHOD route"`
+- `http_method`
+- `http_route`
+- `http_status_code`
+- `duration_us` as a non-negative integer (microseconds — v4 replaced `duration_ms`)
+- `status: "error"` for 5xx, otherwise `"ok"` (v4 replaced the `is_error` boolean)
+
+**Outbound (distributed tracing, opt-in):** to make this service's outbound HTTP
+calls join the same trace, enable `StackTrace.auto({ outboundHttp: { instrumentNodeHttp: true, instrumentFetch: true } })`.
+`instrumentNodeHttp` covers axios/got/follow-redirects on Node. See core rules §8 and
+`docs/client-distributed-tracing.md`.
+
+Before enqueuing request telemetry:
+
+- call the SDK capture gate/check when available, such as `client.shouldCaptureHttpRequest(...)`
+- filter noisy endpoints such as `/health` intentionally in `beforeSend`
+- redact request headers
+- bound header values
+
+Never register both the official HTTP plugin and a custom HTTP telemetry plugin unless duplicate request events/spans are intentionally handled.
+
+DB, business, service, and external spans created during the request must run
+inside the same trace context and set `parent_span_id` to the active parent
+span, normally the HTTP root span. Treat DB spans without parents during a
+request as orphaned telemetry.
+
+---
+
+## 4) StackTrace Setup Module
+
+Keep StackTrace setup in one dedicated module, for example:
+
+```text
+src/observability/stacktrace.ts
+```
+
+That module should own:
+
+- init/auto options
+- optional release resolution from existing build/app config, not from new
+  StackTrace env vars
+- `beforeSend`
+- `onTransportError`
+- optional dev wire logging
+- HTTP telemetry plugin registration
+- monitor transport registration
+- static tags
+- `onResponse` user cleanup
+- `onClose` shutdown
+
+Recommended init options:
+
+```ts
+await StackTrace.auto({
+  apiKey,
+  endpoint,
+  serviceId,
+  sendMode: 'batch',
+  flushIntervalMs: 5000,
+  maxBatchSize: 50,
+  capturePolicyRefreshMs,
+  enableGlobalHandlers: true,
+  beforeSend,
+  onTransportError,
+});
+```
+
+Client env files should follow the dashboard `/integrations` page source of truth: `STACKTRACE_API_KEY`, `STACKTRACE_ENDPOINT`, and `STACKTRACE_SERVICE_ID`. The API key identifies project and tenant automatically; do not add service/environment, tenant, or project env requirements in new client templates.
+
+Static tags may be set after init:
+
+```ts
+StackTrace.tag('app.product', 'client-product');
+StackTrace.tag('stacktrace.integration', 'backend');
+```
+
+Do not set per-request tags.
+
+---
+
+## 5) `beforeSend` Rules
+
+Use `beforeSend` for safe normalization, not for building full canonical v4 payloads manually.
+
+Recommended behavior:
+
+- drop `/health` request telemetry
+- ensure `context.http.method`
+- ensure `context.http.url`
+- ensure `context.http.status_code`
+- ensure `context.http.duration_ms`
+- ensure `context.http.route`
+- merge app monitor HTTP context into SDK HTTP context for captured errors
+
+If the app monitor records `httpServer` context, fold it into `context.http` before sending.
+
+All durations must be rounded to integers before span ingest.
+
+---
+
+## 6) Error Capture Boundary
+
+Use one app monitor pipeline.
+
+Recommended flow:
+
+1. Fastify global error handler maps exceptions to safe HTTP responses.
+2. Error logger/monitor builds internal context.
+3. Monitor transport calls `StackTrace.captureException`.
+4. `beforeSend` normalizes HTTP context.
+
+The monitor context should include safe fields only:
+
+- `errorId`
+- internal code
+- route label
+- method
+- response status
+- duration
+- masked user/customer/tenant identifiers
+- correlation fields
+- safe DB metadata
+
+Never return stack traces, SQL, table/column details, tokens, or connection strings to the browser.
+
+Duplicate captures:
+
+- `runQuery` failures may create SDK DB error events
+- the Fastify error boundary may also capture the same request failure
+- document this behavior and use `errorId`, trace IDs, or dashboard grouping to distinguish it
+
+---
+
+## 7) User Context in Fastify
+
+Because SDK user scope is global, request apps must be careful:
+
+- call `StackTrace.setUser(...)` only after authentication succeeds
+- set safe identifiers only
+- include tenant/customer identifier only if safe and useful
+- call `StackTrace.clearUser()` in `onResponse`
+- do not use per-request tags
+
+In unauthenticated public routes, do not set user context.
+
+---
+
+## 8) Prisma 6+ Instrumentation
+
+Prisma 6 removed `$use`. Do not rely on middleware-based instrumentation.
+
+Use:
+
+- `Prisma.defineExtension`
+- `$extends(...)`
+- one instrumented Prisma client factory
+
+Instrument:
+
+- `$allModels.$allOperations`
+- `$queryRaw`
+- `$executeRaw`
+
+Operation naming:
+
+- model operations: `<Model>.<operation>`, for example `User.findUnique`
+- raw query operations: `<clientLabel>.$queryRaw`
+- raw execute operations: `<clientLabel>.$executeRaw`
+
+Map Prisma operations to SQL verbs:
+
+- `findUnique`, `findFirst`, `findMany`, `count`, `aggregate`, `groupBy` -> `SELECT`
+- `create`, `createMany` -> `INSERT`
+- `update`, `updateMany`, `upsert` -> `UPDATE`
+- `delete`, `deleteMany` -> `DELETE`
+
+Use the real engine as `db.system`, for example:
+
+```text
+sqlserver
+postgres
+mysql
+```
+
+Do not use labels like `prisma`, `prisma-acesso`, or `tenant-db` as `db.system`. Use those labels in operation names or local logs if needed.
+
+---
+
+## 9) Prisma Client Factory
+
+Create Prisma clients through one factory module.
+
+The factory should:
+
+- build the connection URL
+- mask the connection URL in logs
+- create the raw `PrismaClient`
+- apply the StackTrace query extension
+- cache/singleton clients where appropriate
+- expose clean disconnect functions for shutdown/tests
+
+For multi-database apps:
+
+- use one instrumented factory per fixed datastore
+- use tenant/datastore cache keys for tenant clients
+- keep `db.system` consistent across all clients
+- distinguish datastores through operation names or safe metadata, not fake DB systems
+
+Do not instantiate uninstrumented `new PrismaClient()` throughout feature code.
+
+---
+
+## 10) Prisma Raw SQL Rules
+
+Allowed:
+
+- `$queryRaw` with parameterized/template-safe SQL
+- `$executeRaw` with parameterized/template-safe SQL
+
+Forbidden by default:
+
+- `$queryRawUnsafe`
+- `$executeRawUnsafe`
+- string concatenation with untrusted input
+
+For raw Prisma SQL:
+
+- extract table best-effort
+- extract SQL verb best-effort
+- never send full SQL text in telemetry
+- store only `table`, `sqlVerb`, duration, status, and sanitized error metadata
+
+If SQL parsing is heuristic, allow an explicit table/verb override at the repository layer.
+
+---
+
+## 11) Raw SQL Driver Rules
+
+For apps using `mssql`, `pg`, `mysql2`, or another raw driver, create one local helper around driver execution.
+
+The helper should:
+
+- receive the pool/client
+- receive a stable operation name
+- create a request/statement object
+- let the caller bind parameters
+- execute inside `StackTrace.runQuery(realDbSystem, operation, callback, dbOpts)`
+- attach safe DB metadata to thrown errors for the global monitor
+
+MSSQL pattern:
+
+```ts
+await runQuery(
+  pool,
+  'folha.recibo.listByMatricula',
+  async (req) => {
+    req.input('Matricula', sql.Int, matricula);
+    return req.query(sqlText);
+  },
+  { table: 'tb_ReciboPagamento', sqlVerb: 'SELECT' },
+);
+```
+
+Rules:
+
+- always bind parameters with driver APIs such as `.input(...)`
+- never interpolate untrusted values into SQL
+- do not log or send full SQL text
+- use helper functions to derive `table` and `sqlVerb` from static SQL strings
+- keep SQL text local to the helper if it is needed for inference; do not serialize it into spans, events, or logs
+
+---
+
+## 12) Business Spans and Structured Logs
+
+Use `withBusinessContextAsync` for domain context:
+
+- login
+- authorization-sensitive operations
+- document generation
+- configuration changes
+- tenant/client selection
+
+Use `withSpan` for expensive non-DB operations:
+
+- PDF generation
+- external service calls
+- file generation
+- long CPU-bound transformations
+
+Inside a business span, `logStructured` can add a breadcrumb/debug event that keeps trace context.
+
+Do not use success logs as the main latency model when spans are available.
+
+---
+
+## 13) Capture Policy and Dev Wire Logs
+
+Capture policy can suppress healthy requests/spans.
+
+Rules:
+
+- default local debug to `capturePolicyRefreshMs: 0` through code or existing
+  app config
+- enable remote policy only when intentionally testing policy behavior
+- log startup diagnostics showing whether capture gate is active
+
+Development wire diagnostics should:
+
+- log POST target: events/spans
+- log HTTP status
+- log batch size
+- log keys/flags of the first payload item
+- never log headers
+- never log `x-api-key`
+- be disabled in production
+
+Full JSONL payload logging is allowed in development only and must be opt-in.
+
+---
+
+## 14) Fastify + Prisma Troubleshooting
+
+### Events arrive but HTTP spans are missing
+
+1. Verify the HTTP telemetry plugin is registered.
+2. Verify correlation plugin runs before telemetry.
+3. Verify `traceparent` exists by the time telemetry starts.
+4. Verify route is not filtered by capture policy.
+5. Verify span batch POST goes to `/v1/spans` and is accepted with API-key project/tenant scope.
+6. Verify the request event uses the root HTTP span `span_id`.
+
+### Prisma spans are missing
+
+1. Verify all clients are created through the instrumented factory.
+2. Verify `$extends(createStackTracePrismaQueryExtension(...))` is applied.
+3. Verify operations run inside request trace context.
+4. Verify `db.system` is a real engine name.
+5. Verify capture policy allows DB spans.
+6. Verify DB spans have `parent_span_id` when executed during an HTTP request.
+
+### Raw SQL spans are missing
+
+1. Verify raw calls use the local `runQuery` helper.
+2. Verify direct `pool.request().query(...)` calls are limited to scripts/tests.
+3. Verify operation names are stable.
+4. Verify `table` and `sqlVerb` metadata are populated when possible.
+
+### Login or API errors lose correlation
+
+1. Verify global error handler calls monitor/logger.
+2. Verify monitor extracts `x-request-id` and `traceparent`.
+3. Verify monitor transport forwards correlation into `StackTrace.captureException`.
+4. Verify `beforeSend` folds monitor HTTP context into `context.http`.
+
+---
+
+## 15) Minimum Acceptance Checklist
+
+- correlation plugin registered before StackTrace telemetry
+- `x-request-id` and `traceparent` generated and echoed
+- HTTP request event emitted
+- HTTP root span emitted
+- request event `trace.span_id` matches the HTTP root span `span_id`
+- DB/business/external spans have `parent_span_id` during requests
+- final status and duration captured in `onResponse`
+- `/health` filtered intentionally
+- global error handler captures through one monitor transport
+- user context set after auth and cleared on response
+- Prisma clients created through instrumented factory
+- Prisma 6 `$extends` used, not `$use`
+- raw SQL goes through local helper with parameter binding
+- `$queryRawUnsafe` and `$executeRawUnsafe` absent or explicitly justified
+- business spans added for expensive non-DB work
+- dev wire validation confirms `/v1/events` and `/v1/spans`
+- no secrets or full sensitive identifiers in telemetry samples

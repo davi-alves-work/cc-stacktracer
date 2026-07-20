@@ -1,0 +1,907 @@
+---
+alwaysApply: false
+version: 0.4.4
+lastUpdated: 2026-04-30
+ruleset: cc-stacktracer-core
+---
+
+# CC StackTracer Core Rules
+
+Stack-agnostic rules for client applications that integrate `cc-stacktracer`.
+
+These rules are meant for future client projects. They define generic implementation guidance for SDK setup, request telemetry, database spans, privacy, and production-style error capture.
+
+---
+
+## 1) Scope
+
+Apply these rules to every integration, regardless of framework or ORM:
+
+- SDK startup lifecycle
+- event and span wire contract
+- HTTP request correlation
+- database and raw SQL instrumentation
+- error capture boundaries
+- user and business context
+- privacy and sensitive-data handling
+- ClickHouse-ready telemetry shape
+- troubleshooting and verification
+
+Framework-specific files may override registration details, but not the safety, payload, or wire-contract rules here.
+
+---
+
+## 2) Required Configuration
+
+Every enabled client must provide:
+
+- `STACKTRACE_API_KEY`
+- `STACKTRACE_ENDPOINT`
+- `STACKTRACE_SERVICE_ID`
+
+This list follows the dashboard `/integrations` page, section `2. Variaveis de ambiente obrigatorias`, which is the source of truth for client env files. Do not add `STACKTRACE_SERVICE`, `STACKTRACE_ENVIRONMENT`, tenant, or project env vars to new client templates.
+
+`STACKTRACE_ENDPOINT` must be the ingestion base URL only:
+
+```text
+https://ingest.example.com
+```
+
+Do not append:
+
+```text
+/v1/events
+/v1/spans
+/ingest/error
+/ingest/log
+```
+
+The API key identifies the project and tenant automatically. Do not require
+project/tenant env vars in client files unless a future platform contract
+explicitly changes this.
+
+Operational defaults such as release identity, `sendMode`, `flushIntervalMs`,
+`maxBatchSize`, and `capturePolicyRefreshMs` should be configured in code or
+through existing app configuration. Do not add new `STACKTRACE_*` env vars for
+these options in client templates unless the platform contract explicitly
+changes.
+
+Never hardcode API keys, tenant IDs, project IDs, connection strings, passwords, or tokens in source code.
+
+Recommended client `.env` template:
+
+```bash
+# Required: key generated in Settings -> API Keys
+# Identifies project and tenant automatically; no extra variables are needed.
+STACKTRACE_API_KEY=sua-api-key
+
+# Ingestion server URL
+STACKTRACE_ENDPOINT=https://ingest.example.com
+
+# Stable service UUID copied from dashboard /services
+STACKTRACE_SERVICE_ID=00000000-0000-0000-0000-000000000000
+```
+
+---
+
+## 3) Required Ingestion Request Signing
+
+All runtime ingestion requests must be signed. This applies to:
+
+- `POST {STACKTRACE_ENDPOINT}/v1/events`
+- `POST {STACKTRACE_ENDPOINT}/v1/spans`
+
+The API key is also the HMAC signing secret. Do not create a second
+`STACKTRACE_*` secret for signatures unless the platform contract explicitly
+changes.
+
+When using the official SDK transport, signing is an SDK responsibility, not an
+application responsibility. The consumer app should pass `apiKey`, `serviceId`,
+and the endpoint base URL to `StackTrace.auto(...)` or equivalent SDK
+initialization. It must not implement ad hoc HMAC signing, build the
+canonical string, or manually inject signature headers around the standard SDK
+transport.
+
+Required headers:
+
+```text
+x-api-key: <STACKTRACE_API_KEY>
+x-timestamp: <UTC ISO timestamp>
+x-nonce: <unique per request>
+x-signature: v1=<hmac_sha256_hex>
+```
+
+Signature algorithm:
+
+1. Build the event/span batch.
+2. Serialize the JSON body exactly once.
+3. Compute `BODY_SHA256_HEX = SHA256(serializedBody)`.
+4. Build the canonical string:
+
+```text
+v1
+<HTTP_METHOD_UPPERCASE>
+<URL_PATH_WITHOUT_QUERY>
+<X_TIMESTAMP>
+<X_NONCE>
+sha256:<BODY_SHA256_HEX>
+```
+
+5. Compute `HMAC_SHA256(STACKTRACE_API_KEY, canonicalString)` as lowercase hex.
+6. Send exactly the same serialized body used for signing.
+7. Send `x-signature: v1=<hex>`.
+
+The signature is created before sending the request. The signed body must be
+byte-for-byte the same body sent on the wire. Do not parse, mutate, compress, or
+reserialize the body after signing unless the signing step is repeated over the
+final bytes that will be sent.
+
+Example helper:
+
+```ts
+import { createHash, createHmac, randomUUID } from 'node:crypto';
+
+function signIngestionRequest(input: {
+  apiKey: string;
+  method: 'POST';
+  path: '/v1/events' | '/v1/spans';
+  serializedBody: string;
+}) {
+  const timestamp = new Date().toISOString();
+  const nonce = randomUUID();
+  const bodyHash = createHash('sha256').update(input.serializedBody, 'utf8').digest('hex');
+  const canonical = ['v1', input.method, input.path, timestamp, nonce, `sha256:${bodyHash}`].join('\n');
+  const signature = createHmac('sha256', input.apiKey).update(canonical, 'utf8').digest('hex');
+
+  return {
+    'x-api-key': input.apiKey,
+    'x-timestamp': timestamp,
+    'x-nonce': nonce,
+    'x-signature': `v1=${signature}`,
+  };
+}
+```
+
+Client rules:
+
+- sign the exact serialized body sent on the wire
+- never reserialize the body after signing
+- sign the path only, not the full URL and not query strings
+- generate a fresh nonce for every request
+- keep timestamps within the server replay window
+- never log API keys, signatures, authorization headers, cookies, raw HMAC input, the full canonical string, or full sensitive payloads
+- centralize signing in one SDK/helper; do not duplicate ad hoc signing logic across transports
+- treat unsigned ingestion requests as invalid in every non-local environment
+
+Consumer-app rules:
+
+- do not expose `STACKTRACE_API_KEY` in browser code or `VITE_*` variables
+- do not create a second signature secret
+- do not append `/v1/events` or `/v1/spans` to `STACKTRACE_ENDPOINT`; the SDK owns runtime paths
+- do not access, log, persist, or manipulate the canonical signing string
+- any local fetch wrapper or diagnostics layer must be observational only
+- wrappers must not modify headers, body, URL, compression, or serialization after the SDK prepares the request
+- diagnostics may log safe metadata only, such as status code, path, ingest kind (`events` or `spans`), and boolean header presence
+- diagnostics may use booleans like `hasSignatureHeader: true`, but never header values
+
+`401` diagnostics:
+
+- treat ingestion `401` as a transport credential/signature failure
+- guide the user to verify `STACKTRACE_API_KEY`
+- verify `STACKTRACE_ENDPOINT` is a base URL without runtime paths
+- verify the signed path is exactly `/v1/events` or `/v1/spans`
+- verify UTC timestamp skew is within the server replay window
+- verify nonce uniqueness per request
+- verify the body is serialized once and not reserialized after signing
+
+`503` diagnostics (ingestion):
+
+- treat ingestion `503` with `SERVICE_UNAVAILABLE` as **transient infrastructure** (e.g. Redis unavailable during nonce storage), not as invalid API key
+- prefer retry with backoff; see `docs/integrations/troubleshooting-ingest-transport.md` for the full matrix and parallel-emitter checklist
+
+Acceptance checks for client integrations:
+
+- app initialization still passes `apiKey` and endpoint base URL to the SDK
+- a valid event batch receives `202` from `/v1/events`
+- a valid span batch receives `202` from `/v1/spans`
+- an unsigned request receives `401`
+- a request with a body changed after signing receives `401`
+- local logs do not include API key, signature, sensitive headers, canonical string, or payload
+
+---
+
+## 4) Startup Lifecycle
+
+Initialize exactly once during process startup, before serving requests.
+
+Generic order:
+
+1. Load and validate env vars.
+2. Create the framework app instance.
+3. Register correlation/request-id middleware first.
+4. Initialize `StackTrace.init(...)` or `StackTrace.auto(...)`.
+5. Register HTTP telemetry hooks/plugins.
+6. Create instrumented DB clients.
+7. Register routes.
+8. Start listening.
+9. Flush/shutdown telemetry during graceful shutdown.
+
+Rules:
+
+- never call `init` or `auto` inside request handlers
+- never register duplicate monitor transports
+- never register telemetry hooks after traffic can already reach routes
+- keep `serviceId` stable across releases; it is the dashboard `/services` UUID
+- set deploy identity via `release` only when the app already has a build
+  identity source; do not add StackTrace env vars solely for release
+- when `STACKTRACE_API_KEY` is absent, use an explicit no-op behavior
+- on process close, call `StackTrace.shutdown()` or equivalent flush
+
+Example:
+
+```ts
+import { StackTrace } from 'cc-stacktracer';
+
+await StackTrace.auto({
+  apiKey: process.env.STACKTRACE_API_KEY!,
+  endpoint: process.env.STACKTRACE_ENDPOINT!,
+  serviceId: process.env.STACKTRACE_SERVICE_ID!,
+  sendMode: 'batch',
+  flushIntervalMs: 5000,
+  maxBatchSize: 50,
+  enableGlobalHandlers: true,
+});
+```
+
+If the app uses a custom framework plugin instead of SDK auto-registration, it must still use the public SDK/plugin APIs and produce the same event/span shape.
+
+---
+
+## 5) Canonical Wire Contract
+
+The modern runtime contract is:
+
+- events: `POST {STACKTRACE_ENDPOINT}/v1/events`
+- spans: `POST {STACKTRACE_ENDPOINT}/v1/spans`
+
+Event body:
+
+```json
+{ "events": [] }
+```
+
+Batch rule:
+
+- `events` must be an array with `1..100` event objects
+- the batch object must not include extra top-level keys
+
+Span body:
+
+```json
+{ "spans": [] }
+```
+
+Batch rule:
+
+- `spans` must be an array with `1..500` span objects
+- the batch object must not include extra top-level keys
+
+Do not use legacy runtime paths in new clients:
+
+- `/ingest/error`
+- `/ingest/log`
+
+Events must be canonical v4 after SDK normalization:
+
+- each item has `schema_version: 4` (do not send the legacy `schemaVersion`)
+- each item has `type` ∈ `log | error` — the v3 `performance` type was removed; request/operation timing lives in spans, not in a log event
+- W3C-hex trace ids: `trace_id` is 32 lowercase hex, `span_id`/`parent_span_id` are 16 lowercase hex, so events reconcile with the `traceparent` header and with span rows
+- snake_case throughout; unsupported extra top-level fields are rejected (strict)
+
+Source of truth: `packages/shared/schema/canonical-event-v4.schema.ts` (`EventSchemaV4`); contract doc `docs/contracts/payload-v4.md`. Legacy v1/v2/v3 payloads are rejected at the ingest boundary with HTTP 400.
+
+Accepted v4 event fields:
+
+| Field            | Type                                                         | Required        | Notes                                               |
+| ---------------- | ------------------------------------------------------------ | --------------- | --------------------------------------------------- |
+| `schema_version` | literal `4`                                                  | yes             | do not send `schemaVersion`                         |
+| `tenant_id`      | UUID string                                                  | no              | server-owned; ingestion fills from API key          |
+| `project_id`     | UUID string                                                  | no              | server-owned; ingestion fills from API key          |
+| `event_id`       | UUID string                                                  | yes             | generated by SDK (idempotency key)                  |
+| `timestamp`      | ISO timestamp string                                         | yes             | client event timestamp                              |
+| `type`           | `log` \| `error`                                             | yes             | no `performance`; request timing lives in spans     |
+| `level`          | `trace` \| `debug` \| `info` \| `warn` \| `error` \| `fatal` | yes             | match event severity                                |
+| `message`        | string `1..64000`                                            | yes             | sanitized, bounded                                  |
+| `service_id`     | UUID string                                                  | yes             | copied from `STACKTRACE_SERVICE_ID`                 |
+| `service`        | object                                                       | yes             | see service fields below (`name`/`version`/`environment`) |
+| `trace`          | object                                                       | yes             | see trace fields below; `span_id` required; W3C-hex ids |
+| `metadata`       | object                                                       | yes             | structured (`http`, `db`, `business`, `correlation`, `tags`, …); use `{}` when empty |
+| `error`          | object                                                       | only for errors | see error fields below                              |
+
+Accepted `service` fields:
+
+| Field         | Type            | Required | Notes                                                 |
+| ------------- | --------------- | -------- | ----------------------------------------------------- |
+| `name`        | string `1..256` | yes      | display label; do not source from `STACKTRACE_SERVICE` |
+| `version`     | string `0..256` | yes      | SDK may use `unknown`; do not add env solely for this |
+| `environment` | string `1..256` | yes      | `production`, `staging`, `development`, etc.          |
+
+Accepted event `trace` fields:
+
+| Field            | Type                      | Required | Notes                                                   |
+| ---------------- | ------------------------- | -------- | ------------------------------------------------------- |
+| `trace_id`       | 32 lowercase hex string   | yes      | W3C trace id; same value as the `traceparent` trace id  |
+| `span_id`        | 16 lowercase hex string   | yes      | active span for this event                              |
+| `parent_span_id` | 16 lowercase hex or `null`| no       | useful for correlation, but span rows are authoritative |
+
+Accepted `error` fields:
+
+| Field     | Type               | Required | Notes                                                 |
+| --------- | ------------------ | -------- | ----------------------------------------------------- |
+| `type`    | string `1..512`    | yes      | sanitized error class/name                            |
+| `message` | string `1..16000`  | yes      | sanitized message                                     |
+| `stack`   | string `0..512000` | no       | sanitized stack; redact SQL/secrets/paths when needed |
+
+Accepted `metadata` blocks:
+
+| Block              | Type                    | Notes                                           |
+| ------------------ | ----------------------- | ----------------------------------------------- |
+| `http`             | object                  | HTTP request/response metadata                  |
+| `db`               | object                  | DB operation metadata                           |
+| `business`         | object                  | product/domain operation metadata               |
+| `runtime`          | object                  | process/runtime metadata                        |
+| `resource`         | object                  | generic resource attribution                    |
+| `tags`             | record string to string | low-cardinality dimensions only                 |
+| `queue`            | object                  | queue/job metadata                              |
+| `critical`         | boolean                 | capture-policy hint                             |
+| `capture_critical` | boolean                 | capture-policy hint                             |
+| `ingestion`        | object                  | collector/worker owned; clients should not send |
+
+Accepted `metadata.http` fields:
+
+| Field         | Type                | Required            | Notes                                         |
+| ------------- | ------------------- | ------------------- | --------------------------------------------- |
+| `method`      | string `1..32`      | yes for HTTP events | uppercase method preferred                    |
+| `route`       | string `1..2048`    | yes for HTTP events | route template or masked path; no raw IDs     |
+| `url`         | string `0..8192`    | no                  | sanitized path/URL; no sensitive query string |
+| `status_code` | integer             | yes for HTTP events | response status                               |
+| `duration_ms` | non-negative number | yes for HTTP events | round before span ingest                      |
+
+Accepted `metadata.db` fields:
+
+| Field         | Type                                                           | Required            | Notes                                                               |
+| ------------- | -------------------------------------------------------------- | ------------------- | ------------------------------------------------------------------- |
+| `system`      | `sqlserver` \| `postgres` \| `mysql` \| string `1..128`        | yes for DB metadata | real engine name, not adapter label                                 |
+| `operation`   | `SELECT` \| `INSERT` \| `UPDATE` \| `DELETE` \| string `1..64` | yes for DB metadata | stable verb/operation                                               |
+| `table`       | string `1..256`                                                | yes for DB metadata | table/object when known                                             |
+| `duration_ms` | non-negative number                                            | yes for DB metadata | DB duration                                                         |
+| `statement`   | string `0..500`                                                | avoid in clients    | schema accepts truncated text, but new clients should omit SQL text |
+| `rows`        | non-negative integer                                           | no                  | safe row count only                                                 |
+
+Accepted `metadata.business` fields:
+
+| Field            | Type             | Required | Notes                            |
+| ---------------- | ---------------- | -------- | -------------------------------- |
+| `entity`         | string `1..256`  | yes      | stable business entity           |
+| `operation`      | string `1..256`  | yes      | stable operation name            |
+| `fields_changed` | array of strings | no       | max 64 items, each max 128 chars |
+| `user_id`        | string `0..256`  | no       | safe/opaque user identifier only |
+
+Accepted `metadata.runtime` fields:
+
+| Field          | Type           | Required |
+| -------------- | -------------- | -------- |
+| `node_version` | string `0..64` | no       |
+| `platform`     | string `0..64` | no       |
+| `arch`         | string `0..32` | no       |
+
+Accepted `metadata.resource` fields:
+
+| Field  | Type            | Required |
+| ------ | --------------- | -------- |
+| `name` | string `1..512` | yes      |
+| `type` | string `1..128` | yes      |
+
+Accepted `metadata.tags` fields:
+
+- record/object where each key is a string `1..128`
+- each value is a string `1..1024`
+- keep values low-cardinality; do not put request IDs, raw user IDs, SQL, or tokens in tags
+
+Accepted `metadata.queue` fields:
+
+| Field         | Type                | Required |
+| ------------- | ------------------- | -------- |
+| `name`        | string `0..512`     | no       |
+| `duration_ms` | non-negative number | no       |
+
+Spans must be strict-ingest compatible:
+
+- `trace_id`
+- `span_id`
+- `span_type`
+- `span_name`
+- `start_time`
+- `end_time`
+- integer `duration_us` (microseconds — v4 replaced `duration_ms`)
+- `status` (`unset` \| `ok` \| `error` — v4 replaced the `is_error` boolean; `is_error` is derived server-side)
+- `service_id` plus service display labels
+- tenant/project fields are optional on the client wire payload and filled by ingestion API key scope
+
+Accepted span row fields:
+
+| Field              | Type                                                              | Required | Notes                            |
+| ------------------ | ----------------------------------------------------------------- | -------- | -------------------------------- |
+| `span_timestamp`   | string `1..80`                                                    | yes      | ISO timestamp preferred          |
+| `trace_id`         | string `1..256`                                                   | yes      | same trace as related events     |
+| `span_id`          | string `1..128`                                                   | yes      | string tracing ID, not UUID-only |
+| `parent_span_id`   | string `1..128` or `null`                                         | no       | `null` only for root spans       |
+| `tenant_id`        | UUID string or `null`                                             | no       | omit in clients                  |
+| `project_id`       | UUID string or `null`                                             | no       | omit in clients                  |
+| `service_id`       | UUID string                                                       | yes      | copied from `STACKTRACE_SERVICE_ID` |
+| `service_name`     | string `0..512` or `null`                                         | no       | stable service name              |
+| `service_version`  | string `0..256` or `null`                                         | no       | build/release when available     |
+| `environment`      | string `0..256` or `null`                                         | no       | deployment environment           |
+| `span_name`        | string `0..1024` or `null`                                        | no       | stable operation name            |
+| `span_type`        | `http` \| `db` \| `business` \| `service` \| `external` or `null` | no       | low-cardinality                  |
+| `start_time`       | string `1..80`                                                    | yes      | ISO timestamp preferred          |
+| `end_time`         | string `1..80`                                                    | yes      | ISO timestamp preferred          |
+| `duration_us`      | integer `0..86400000000`                                          | yes      | microseconds; must be integer    |
+| `status`           | `unset` \| `ok` \| `error`                                        | no       | defaults `unset`; `is_error` derived on read |
+| `http_method`      | string `0..32` or `null`                                          | no       | for HTTP spans                   |
+| `http_route`       | string `0..4096` or `null`                                        | no       | template/masked route            |
+| `http_status_code` | integer `100..599` or `null`                                      | no       | for HTTP spans                   |
+| `db_system`        | string `0..128` or `null`                                         | no       | real DB engine                   |
+| `db_operation`     | string `0..512` or `null`                                         | no       | verb/operation                   |
+| `db_table`         | string `0..256` or `null`                                         | no       | safe table/object                |
+| `db_duration_us`   | integer `0..86400000000` or `null`                                | no       | DB duration in microseconds      |
+| `error_type`       | string `0..512` or `null`                                         | no       | sanitized                        |
+| `error_message`    | string `0..16000` or `null`                                       | no       | sanitized                        |
+| `trace_flags`      | string `0..64` or `null`                                          | no       | W3C flags (`01` = sampled) when available |
+| `attributes`       | record/object or `null`                                           | no       | persisted; bounded, sanitized, no secrets (v4 replaced the always-null `metadata`) |
+
+Payload rejection rules:
+
+- v4 event objects are strict; do not add unsupported top-level fields
+- span row objects are strict; do not add unsupported top-level fields
+- use snake_case for wire fields
+- use `metadata.http.status_code`, not `response_status_code`, in v4 client events
+- do not send top-level `http`, `db`, `queue`, `user`, or `tags` in v4 events; put supported blocks under `metadata`
+- do not send full SQL, bindings, request/response bodies, tokens, cookies, or authorization headers anywhere in the payload
+
+Span identity contract:
+
+- `trace_id` is a tracing identifier string, not a database UUID requirement
+- `span_id` is a tracing identifier string with length `1..128`, not a database UUID requirement
+- `parent_span_id` is `null` for root spans or a tracing identifier string with length `1..128`
+- W3C span IDs such as `ebb4484086c5a6f4` must be accepted
+- legacy UUID-looking span IDs may still be accepted, but clients must not be forced to generate UUIDs
+- persistence must store `spans.span_id` and `spans.parent_span_id` as string/text columns and must not cast them to UUID
+
+Event/span correlation contract:
+
+- each captured HTTP request must create one root HTTP span with `parent_span_id: null`
+- the HTTP request event must share the same `trace_id` as the root HTTP span
+- the HTTP request event must set `trace.span_id` to the root HTTP span `span_id`
+- events captured inside DB, business, service, or external spans must keep the same `trace_id` and set `trace.span_id` to the active child span
+- DB, business, service, and external spans created during a request must set `parent_span_id` to the active parent span, normally the HTTP root span
+- spans without `parent_span_id` are valid only for true roots; child spans without parents are considered orphaned telemetry
+- dashboards reconstruct the full path from `trace_id`, `span_id`, and `parent_span_id`, so framework integrations must preserve async trace context across handlers, ORMs, raw drivers, and manual spans
+
+Tenant/project contract:
+
+- clients should omit `tenant_id` and `project_id` from spans/events unless they are using an explicit legacy SDK mode
+- ingestion resolves `tenant_id` and `project_id` from `x-api-key`
+- if a client does send `tenant_id` or `project_id`, ingestion must reject mismatches with the API key scope
+- do not require project/tenant env vars for deployment
+
+Server deployment requirement:
+
+- ingestion schema must accept string span IDs in `POST /v1/spans`
+- Postgres migration `029_spans_span_ids_text.sql` or equivalent must be applied in existing databases
+- fresh schemas must create `spans.span_id` and `spans.parent_span_id` as `TEXT`/string, while `tenant_id` and `project_id` remain UUIDs
+
+Do not build canonical v4 objects manually unless the SDK cannot represent the case. Prefer SDK builders, `beforeSend`, `runQuery`, and `withSpan`.
+
+---
+
+## 6) ClickHouse-Ready Telemetry Shape
+
+Even while the platform stores high-volume tables in Postgres, client telemetry must be shaped for future analytical storage.
+
+Rules:
+
+- keep high-cardinality values out of primary grouping fields
+- use route templates (`/users/:id`) instead of concrete paths
+- mask fallback paths (`/users/:id`, not `/users/123`)
+- keep `service`, `environment`, `span_type`, `db_system`, `db_operation`, and HTTP method/status low-cardinality
+- bound metadata size and depth
+- avoid arrays of large records in metadata
+- avoid full request/response bodies
+- do not send raw SQL text
+- prefer stable operation names like `domain.action` or `Model.operation`
+- store IDs only when safe and useful, and prefer masked/business-safe forms
+
+Client code should not rely on Postgres-specific persistence details. Treat events and spans as append-only analytical facts.
+
+---
+
+## 7) Correlation and Request Context
+
+Every HTTP-capable client should propagate:
+
+- `x-request-id`
+- W3C `traceparent`
+
+If incoming headers are absent, generate them before telemetry hooks run and echo them in the response.
+
+Request telemetry must include:
+
+- method
+- normalized route
+- status code
+- integer duration in milliseconds
+- client IP/user-agent only when safe
+- root HTTP `span_id` available to the request event
+- active trace context available to child DB/business/external spans
+
+When route templates are unavailable, fallback to:
+
+```text
+METHOD /masked/path/:id
+```
+
+Do not use raw URLs with query strings as route grouping keys.
+
+---
+
+## 8) Trace Context and Error/Span Linkage
+
+Every integration must preserve trace context from request entry until response
+finish and error capture. The most common implementation bug is an error event
+that is sent successfully but is not related to any span. Treat that as a
+failed tracing implementation, not as a dashboard issue.
+
+Required request trace lifecycle:
+
+1. At the start of the request, create or preserve `trace_id` (adopt the inbound
+   `traceparent` trace id when present).
+2. At the start of the request, create the HTTP root `span_id`.
+3. Make the HTTP root span active before controllers/services/repositories run.
+4. Execute the whole request pipeline inside the active trace context.
+5. Capture thrown errors before the trace context is disposed.
+6. Emit the HTTP request as the HTTP root **span**. Its `parent_span_id` is `null`
+   for a trace origin, or the inbound `traceparent` parent id for a downstream
+   instrumented service. There is no separate request log event in v4 — request
+   timing lives in the span.
+7. Any log/error event emitted during the request carries `trace.span_id` equal to
+   the active span (the HTTP root span at the boundary).
+8. Emit DB/business/service/external spans with `parent_span_id` set to the
+   active parent span.
+
+Rules:
+
+- do not create the HTTP root span only at response-finish time; the root
+  `span_id` must exist and be active while the request is running
+- do not create a new trace inside the global exception handler when an active
+  request trace already exists
+- if the framework exception handler runs after normal middleware unwinds,
+  store a safe trace snapshot on the framework request/context object and use
+  it to keep `trace_id` and `span_id`
+- `StackTrace.captureException(...)` for request errors must run inside the
+  active request trace context or receive context that preserves the active
+  `trace_id` and `span_id`
+- DB observers, ORM hooks, event emitters, callbacks, timers, and queue handlers
+  must re-enter or preserve trace context before creating spans/events
+- background jobs with no HTTP request must create their own root
+  `service`/`business` span and capture events inside that span
+- errors captured inside a DB/business/service/external span must use that child
+  span as `trace.span_id`
+- errors captured at the HTTP boundary should use the active span when present;
+  otherwise they should use the HTTP root span
+- child spans without `parent_span_id` during an HTTP request are orphaned
+  telemetry and must be fixed
+
+Validation for this bug class:
+
+- log a safe temporary diagnostic with only `requestId`, `trace_id`,
+  `root_span_id`, active `span_id`, and child `parent_span_id`
+- if an error has no `trace.span_id`, it was captured outside the active span
+- if an error has `trace.span_id` but no span row exists with that `span_id`,
+  span sending/persistence or capture policy is the likely problem
+- if DB spans have `parent_span_id: null` during HTTP requests, async context was
+  lost before DB instrumentation
+- never log `x-api-key`, `authorization`, cookies, SQL, bindings, request body,
+  passwords, or national IDs while debugging tracing
+
+### Distributed tracing across services (outbound propagation)
+
+A single trace spans multiple services only when the caller injects `traceparent`
+into its outbound HTTP calls and the callee adopts it. The SDK does both halves:
+
+- **Inbound (automatic):** the HTTP root span adopts the inbound `traceparent`
+  parent id, so this service links to its upstream caller. No configuration.
+- **Outbound (opt-in):** instrument the HTTP calls this service makes, so each
+  outbound call gets an `external` client span and a `traceparent` header carrying
+  that client span id. The downstream service then parents its root span to it.
+
+Enable outbound at startup (after `auto`/`init`, once, never per-request):
+
+```ts
+StackTrace.auto({
+  apiKey: process.env.STACKTRACE_API_KEY!,
+  endpoint: process.env.STACKTRACE_ENDPOINT!,
+  serviceId: process.env.STACKTRACE_SERVICE_ID!,
+  outboundHttp: {
+    instrumentFetch: true, // global fetch / undici
+    instrumentNodeHttp: true, // node:http + node:https → also covers axios, got, follow-redirects
+  },
+});
+```
+
+Rules:
+
+- `instrumentNodeHttp` is the one that matters for most Node clients: axios, got and
+  follow-redirects all go through `node:http`, so one switch covers them. Add
+  `instrumentFetch` only if the app calls global `fetch`/`undici` directly.
+- The outbound client span is a **leaf** span (it is not pushed on the active span
+  stack), so concurrent outbound calls never mis-parent each other.
+- Instrumentation is idempotent — calling it twice is a no-op — and it never traces
+  the SDK's own calls to `STACKTRACE_ENDPOINT` (no self-tracing).
+- No request/response headers or bodies are captured by default. Only method, host,
+  route/target, status, and timing land on the span.
+- Tag internal vs third-party dependencies with `internalServiceMap` /
+  `serviceNameResolver` (sets `peer.kind` / `peer.service`) so the dashboard can
+  group cross-service hops. Use `ignoreUrls` to skip noisy endpoints.
+- If a downstream service is not instrumented, the outbound span still records the
+  external dependency; the trace simply ends there (shown as a partial trace, not an
+  error).
+
+Full options and validation steps: `docs/client-distributed-tracing.md`.
+
+---
+
+## 9) User, Tags, and Business Context
+
+Use user context carefully.
+
+Current SDK user scope is process/global state. In request-based servers:
+
+- call `StackTrace.setUser(...)` only after authentication
+- set only safe identifiers
+- clear user context after the response
+- never set per-request tags
+- use static tags only for deploy/app identity
+
+Preferred static tags:
+
+- `app.product`
+- `stacktrace.integration`
+- `deployment.region`
+
+For domain operations, use business context:
+
+```ts
+await StackTrace.withBusinessContextAsync({ entity: 'invoice', operation: 'create' }, async () => createInvoice());
+```
+
+Use `withSpan` for expensive non-DB work:
+
+```ts
+await StackTrace.withSpan('invoice.pdf.generate', () => generatePdf(), {
+  type: 'business',
+  attributes: { operation: 'invoice_pdf' },
+});
+```
+
+---
+
+## 10) Database Instrumentation Standard
+
+Use `runQuery` for important, slow, or high-impact DB operations.
+
+```ts
+import { runQuery } from 'cc-stacktracer';
+
+await runQuery('postgres', 'orders.findById', () => repo.findById(id), {
+  table: 'orders',
+  sqlVerb: 'SELECT',
+});
+```
+
+Rules:
+
+- use real DB engine names: `postgres`, `mysql`, `sqlserver`, `mongodb`
+- do not use adapter labels as `db.system`
+- use stable operation names: `domain.action` or `Model.operation`
+- include `table` when known
+- include `sqlVerb` when known
+- do not send SQL text in telemetry payloads; when SQL is used locally for inference, the SDK/plugin must guarantee it is not serialized
+- never swallow exceptions inside the callback
+- never instrument by copying secrets into metadata
+- regardless of ORM, query builder, or raw SQL, DB failures must set the DB span/error event `message` and `stack` fields to the sanitized database-returned error message/stack instead of replacing them with only a generic wrapper
+- sanitize DB error `message` and `stack` before serialization: redact SQL text, bind values, connection strings, usernames, passwords, IP addresses, credentials, tokens, request data, and other sensitive fragments; preserve safe diagnostics such as DB error code, SQLSTATE, operation, table, or constraint only when safe
+
+For ORMs:
+
+- prefer centralized interception when it is reliable
+- use repository-level wrappers for critical paths that need clearer names
+- do not instrument every tiny query blindly in high-volume list endpoints
+
+For raw SQL:
+
+- use parameterized queries only
+- wrap raw driver calls in one local helper
+- derive `table` and `sqlVerb` where possible
+- ban unsafe raw APIs by default
+- attach safe DB metadata to thrown errors when a global error monitor will capture them
+
+---
+
+## 11) Error Capture Boundary
+
+Keep one canonical application error pipeline.
+
+Recommended pattern:
+
+1. Domain/repository code throws real errors.
+2. Framework error handler maps user-facing responses.
+3. Internal monitor captures sanitized diagnostic context.
+4. A single cc-stacktracer monitor transport calls `StackTrace.captureException`.
+
+Rules:
+
+- capture real `Error` objects whenever possible
+- preserve stack traces internally
+- return sanitized messages to users
+- preserve the active `trace_id` and `span_id` when capturing request errors
+- never emit an HTTP request error without `trace.span_id` unless there is truly
+  no active request/job span
+- include safe context: error ID, route, method, duration, tenant/project/client identifiers when safe
+- for DB-originated failures, the error event and failed span must expose the sanitized database-returned error message/stack in `message` and `stack`, with usernames, passwords, IP addresses, and other sensitive fragments removed or masked
+- avoid duplicate captures for the same failure unless intentional
+- document known duplicate paths, such as DB `runQuery` failure plus HTTP boundary capture
+- make transport registration idempotent
+
+Example:
+
+```ts
+try {
+  await operation();
+} catch (err) {
+  const error = err instanceof Error ? err : new Error(String(err));
+  StackTrace.captureException(error, { operation: 'orders.create' });
+  throw error;
+}
+```
+
+---
+
+## 12) Security and Privacy
+
+Never emit:
+
+- passwords
+- access tokens
+- API keys
+- cookies
+- authorization headers
+- raw payment/card data
+- connection strings
+- full CPF/SSN/national IDs
+- full request/response bodies unless explicitly approved
+
+Always:
+
+- redact headers before telemetry
+- sanitize nested metadata
+- mask sensitive identifiers
+- limit string sizes
+- avoid full model snapshots
+- avoid full ORM payloads
+- avoid logging SQL with interpolated user input
+
+Headers such as `x-api-key`, `authorization`, `cookie`, and `set-cookie` must never be sent in telemetry.
+
+---
+
+## 13) Development Diagnostics
+
+Future clients should include a safe debug path for integration validation.
+
+Allowed in development only:
+
+- wire summary of SDK requests to ingestion
+- JSONL payload logs for `/v1/events` and `/v1/spans`
+- mock-fetch transport tests
+
+Diagnostics must not log headers or secrets.
+
+Validate:
+
+- endpoint base URL
+- `/v1/events` and `/v1/spans` are used
+- `schema_version: 4` exists on events
+- no legacy `schemaVersion` appears on the wire
+- event `type` is `log` or `error` (never `performance`)
+- first span has trace/span IDs (W3C-hex: 32 hex trace, 16 hex span)
+- log/error events emitted in a request have `trace.span_id` of the active span
+- child spans have `parent_span_id` when created inside a request
+- span duration is integer microseconds (`duration_us`), and `status` is set
+- span IDs are accepted as strings, including W3C 16-hex IDs
+- API key project/tenant scope is accepted by ingestion without client-provided tenant/project IDs
+- ingestion returns `202`
+
+---
+
+## 14) Troubleshooting by Symptom
+
+### Events arrive, spans do not
+
+1. Verify there is an active trace context.
+2. Verify HTTP root span plugin/hook runs.
+3. Verify `runQuery` or `withSpan` runs inside request context.
+4. Verify API key project/tenant scope is accepted by ingestion.
+5. Check capture policy filters.
+6. Check queue flush/shutdown behavior.
+7. Confirm child spans are not orphaned and have `parent_span_id`.
+
+### Errors arrive but are not related to spans
+
+1. Verify the HTTP root `span_id` is created before controllers run.
+2. Verify the full request pipeline runs inside trace context.
+3. Verify the global exception handler captures before context disposal or uses
+   the safe trace snapshot saved on the request.
+4. Verify `captureException` is not called manually outside `withSpan`,
+   `runQuery`, or request context.
+5. Verify the error event has `trace.trace_id` and `trace.span_id`.
+6. If `trace.span_id` exists, verify a span row with the same `span_id` was sent
+   to `/v1/spans` and persisted.
+7. Verify capture policy did not allow errors while suppressing the related
+   HTTP/DB spans.
+
+### Request logs missing on healthy endpoints
+
+1. Check capture policy.
+2. Check plugin registration order.
+3. Check route fallback logic.
+4. Check whether `/health` or 2xx routes are intentionally filtered.
+
+### Duplicate errors appear
+
+1. Check `runQuery` error capture plus global HTTP error capture.
+2. Check duplicate monitor transport registration.
+3. Keep one primary boundary and document exceptions.
+
+### 400 from ingestion
+
+1. Inspect first event/span payload in dev wire logs.
+2. Validate strict v4 event shape (`schema_version: 4`, snake_case, W3C-hex ids).
+3. Validate strict span row shape (`duration_us`, `status`, `attributes`).
+4. Confirm `span_id` and `parent_span_id` are strings, not forced UUIDs.
+5. Confirm `tenant_id` and `project_id` are omitted or match the API key scope.
+6. Confirm the ingestion server has the string-span-ID schema and migration applied.
+7. Confirm no unsupported top-level fields were added manually.
+
+---
+
+## 15) Definition of Done
+
+A client integration is complete when:
+
+- SDK initializes once at startup
+- endpoint is base URL only
+- events use `/v1/events`
+- spans use `/v1/spans`
+- correlation headers are generated/propagated
+- request telemetry works in one critical flow
+- request events are linked to the HTTP root span by `trace.span_id`
+- DB/business/external spans have `parent_span_id` when created inside requests
+- errors are captured through one canonical monitor boundary
+- DB operations are wrapped with `runQuery`
+- raw SQL uses parameterized queries and helper wrappers
+- expensive business work uses `withSpan`
+- user context is cleared after each request
+- no sensitive data appears in sample payloads
+- payload/spans quality gates pass
+- shutdown flushes queued telemetry

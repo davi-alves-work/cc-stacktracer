@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "cc-stacktracer": ["./src/index.ts"],
+      "cc-stacktracer/fastify": ["./src/integrations/fastify.ts"],
+      "cc-stacktracer/express": ["./src/integrations/express.ts"],
+      "cc-stacktracer/adonis": ["./src/integrations/adonis.ts"],
+      "cc-stacktracer/generic-http": ["./src/generic-http/index.ts"],
+      "cc-stacktracer/db-prisma": ["./src/db/prisma.ts"],
+      "cc-stacktracer/db-lucid": ["./src/db/lucid.ts"],
+      "cc-stacktracer/plugin-sdk": ["./src/plugin-sdk.ts"]
+    }
+  },
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
