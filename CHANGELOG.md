@@ -4,6 +4,21 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-07-22
+
+### Changed
+
+- Client-aborted HTTP requests no longer mark the root span as `status: 'error'`. An abort is a
+  transport fact (connection closed before the response finished), not an operation failure — the
+  server classifies it from the new flag instead of treating it as an application error.
+
+### Added
+
+- Optional `http_aborted` boolean on HTTP root spans (`true` when the client closed the connection
+  early). Additive on the v4 span shape; omitted/`false` means not aborted.
+- Shared `httpRootSpanOutcome` helper used by the Express, Fastify, and Adonis integrations so
+  abort semantics stay consistent across frameworks.
+
 ## [2.0.0] - 2026-07-20
 
 First release published to the public npm registry. Install with

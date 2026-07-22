@@ -108,8 +108,11 @@ describe('Express middleware', () => {
     const span = sentPayloads(transport).find((item) => item.kind === 'spans')?.spans[0];
     expect(span?.span_type).toBe('http');
     expect(span?.http_route).toBe('/slow');
-    expect(span?.status).toBe('error');
+    // Abort is a transport fact, not an operation failure.
+    expect(span?.status).toBe('ok');
+    expect(span?.http_aborted).toBe(true);
     expect(span?.http_status_code).toBeNull();
+    expect(span?.error_type).toBeNull();
 
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });

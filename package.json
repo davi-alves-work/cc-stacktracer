@@ -1,6 +1,6 @@
 {
   "name": "cc-stacktracer",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Observability SDK for Node.js — captures errors, structured logs, distributed traces and database spans, and ships them to a CC StackTracer ingestion API.",
   "license": "MIT",
   "type": "module",

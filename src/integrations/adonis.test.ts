@@ -100,8 +100,11 @@ describe('Adonis middleware', () => {
     const span = transport.mock.calls.find((c) => c[0]?.kind === 'spans')?.[0]?.spans?.[0];
     expect(span?.span_type).toBe('http');
     expect(span?.http_route).toBe('/slow');
-    expect(span?.status).toBe('error');
+    // Abort is a transport fact, not an operation failure.
+    expect(span?.status).toBe('ok');
+    expect(span?.http_aborted).toBe(true);
     expect(span?.http_status_code).toBeNull();
+    expect(span?.error_type).toBeNull();
   });
 
   it('calls onFinish after next() when response has no on()', async () => {

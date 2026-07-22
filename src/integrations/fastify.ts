@@ -11,6 +11,7 @@ import { redactHeaders } from '../utils/redact-headers.js';
 import { headersToRecord } from '../utils/headers.js';
 import { redactUrl } from '../utils/redact-url.js';
 import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
+import { httpRootSpanOutcome } from './http-root-span-outcome.js';
 
 export type StacktracePluginOptions = {
   /** Override for tests; defaults to singleton from init(). */
@@ -97,12 +98,9 @@ function emitRootSpan(
     start_time: startIso,
     end_time: endIso,
     duration_us: Math.max(0, Math.round(durationMs * 1000)),
-    status: aborted || reply.statusCode >= 500 ? 'error' : 'ok',
+    ...httpRootSpanOutcome(aborted, reply.statusCode),
     http_method: request.method,
     http_route: httpRoute.slice(0, 4096),
-    http_status_code: aborted ? null : reply.statusCode,
-    error_type: aborted ? 'aborted' : null,
-    error_message: aborted ? 'Client closed request before the response finished' : null,
   });
 }
 

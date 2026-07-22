@@ -26,6 +26,8 @@ export type SdkSpanRow = {
   http_method?: string | null;
   http_route?: string | null;
   http_status_code?: number | null;
+  /** Client disconnected before the response finished. Transport fact, not an operation failure. */
+  http_aborted?: boolean;
   db_system?: string | null;
   db_operation?: string | null;
   db_table?: string | null;

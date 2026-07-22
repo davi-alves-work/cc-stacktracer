@@ -8,6 +8,7 @@ import { extractCorrelationFromHeaders } from '../utils/correlation.js';
 import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { redactHeaders } from '../utils/redact-headers.js';
 import { redactUrl } from '../utils/redact-url.js';
+import { httpRootSpanOutcome } from './http-root-span-outcome.js';
 
 export type StacktraceAdonisOptions = {
   /** Override for tests; defaults to singleton from init(). */
@@ -112,12 +113,9 @@ export function stacktraceAdonisMiddleware(
         start_time: startIso,
         end_time: endIso,
         duration_us: Math.max(0, Math.round(durationMs * 1000)),
-        status: aborted || statusCode >= 500 ? 'error' : 'ok',
+        ...httpRootSpanOutcome(aborted, statusCode),
         http_method: method,
         http_route: httpRoute.slice(0, 4096),
-        http_status_code: aborted ? null : statusCode,
-        error_type: aborted ? 'aborted' : null,
-        error_message: aborted ? 'Client closed request before the response finished' : null,
       });
     };
 
