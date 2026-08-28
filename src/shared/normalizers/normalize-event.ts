@@ -149,6 +149,42 @@ function randomHex(chars: number): string {
 }
 
 /**
+ * Identidade do usuário final. Até a 2.1.x isto caía no ramo `typeof v === 'object'` abaixo e era
+ * DESCARTADO via `onDroppedContextKey` — `setUser()` não chegava a lugar nenhum.
+ *
+ * `tenantId` vira `end_user_tenant` de propósito: é o tenant da aplicação DO CLIENTE, e o nome curto
+ * seria confundido com o `tenant_id` da plataforma, que é a organização dona da API key e é injetado
+ * pelo servidor.
+ */
+function v1MetadataToUser(
+  meta: Record<string, unknown>,
+): { id: string; end_user_tenant?: string; email_hash?: string } | undefined {
+  const raw = meta.user;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const rec = raw as Record<string, unknown>;
+  // Sem id não há identidade: o evento segue inteiro, só sem o bloco.
+  const id = typeof rec.id === 'string' && rec.id.trim() !== '' ? rec.id : undefined;
+  if (id === undefined) return undefined;
+  const endUserTenant = typeof rec.tenantId === 'string' && rec.tenantId.trim() !== '' ? rec.tenantId : undefined;
+  const emailHash = typeof rec.emailHash === 'string' && rec.emailHash.trim() !== '' ? rec.emailHash : undefined;
+  return {
+    id,
+    ...(endUserTenant !== undefined ? { end_user_tenant: endUserTenant } : {}),
+    ...(emailHash !== undefined ? { email_hash: emailHash } : {}),
+  };
+}
+
+/**
+ * Recorte da aplicação do cliente. Não há API de SDK para isto — é campo opcional de payload, que o
+ * cliente preenche em cada envio. O servidor também aceita o valor chegando como tag, então este
+ * mapeamento é higiene (evita duplicar no saco de tags), não requisito.
+ */
+function v1MetadataToSubtenant(meta: Record<string, unknown>): string | undefined {
+  const raw = meta.subtenant;
+  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined;
+}
+
+/**
  * Structured `metadata` block shared by the v3 and v4 mappers — folds the v1 top-level `http`/`db`/`queue`
  * blocks and the loose metadata keys into the strict {@link MetadataSchema} (scalar extras become `tags`).
  */
@@ -182,6 +218,8 @@ function structureMetadataFromV1Event(
     'request',
     'response',
     'queue',
+    'user',
+    'subtenant',
   ]);
   const metaTags: Record<string, string> = {};
   for (const [k, v] of Object.entries(meta)) {
@@ -209,6 +247,14 @@ function structureMetadataFromV1Event(
   }
   if (correlation !== undefined) {
     metadataPayload.correlation = correlation;
+  }
+  const user = v1MetadataToUser(meta);
+  if (user !== undefined) {
+    metadataPayload.user = user;
+  }
+  const subtenant = v1MetadataToSubtenant(meta);
+  if (subtenant !== undefined) {
+    metadataPayload.subtenant = subtenant;
   }
   if (Object.keys(mergedTags).length > 0) {
     metadataPayload.tags = mergedTags;

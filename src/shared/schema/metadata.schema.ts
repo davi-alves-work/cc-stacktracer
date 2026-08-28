@@ -6,6 +6,7 @@ import { ResourceSchema } from './resource.schema.js';
 import { RuntimeSchema } from './runtime.schema.js';
 import { TagsSchema } from './tags.schema.js';
 import { iso8601TimestampSchema } from './timestamp.schema.js';
+import { UserSchema } from './user.schema.js';
 
 /**
  * Collector-added metadata merged at ingest (`enrichCanonicalEvent` / stream replay).
@@ -56,6 +57,20 @@ export const MetadataSchema = z
       })
       .optional(),
     correlation: CorrelationSchema.optional(),
+    /** Identidade do usuario final da aplicacao do cliente (SDK: setUser). */
+    user: UserSchema.optional(),
+    /**
+     * Tenant da aplicacao do cliente — a "PM Peruibe" dentro da "Ouvidoria".
+     *
+     * NAO ha API de SDK para isto: e campo OPCIONAL de payload, preenchido pelo cliente em cada
+     * envio (`captureError(err, { subtenant })` ou `withSpan(nome, { attributes: { subtenant } })`).
+     * O servidor tambem aceita o valor chegando como tag — ver `extractSubtenant` nos writers.
+     *
+     * NAO confundir com `tenant_id`, que e a organizacao dona da API key. Este e o recorte de dados
+     * do cliente dentro do proprio projeto dele: dimensao de filtro nas telas de investigacao, nunca
+     * escopo de acesso.
+     */
+    subtenant: z.string().min(1).max(256).optional(),
     /** Ingestion API / worker merge — must match {@link IngestionMetadataSchema}. */
     ingestion: IngestionMetadataSchema.optional(),
     /** Capture policy: exempt from sampling when true. */

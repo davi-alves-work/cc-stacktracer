@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { getBusinessContext } from './business-context.js';
-import { getScopeContextForMerge } from './scope-metadata.js';
+import { getScopeContextForMerge, runWithScope } from './scope-metadata.js';
 import { extractCorrelationFromHeaders, hasCorrelationData } from '../utils/correlation.js';
 import { getTraceSpanState } from './trace-span-context.js';
 
@@ -15,12 +15,21 @@ export type HttpRequestSnapshot = {
 
 const storage = new AsyncLocalStorage<HttpRequestSnapshot>();
 
+/**
+ * Abre o contexto de requisição — o snapshot HTTP E o escopo de `setUser`/`tag`.
+ *
+ * As duas coisas viajam juntas de propósito. Elas têm exatamente o mesmo tempo de vida (uma
+ * requisição) e o mesmo modo de falha: estado que sobrevive à requisição vira dado atribuído à
+ * requisição errada. Compor aqui, e não nas integrações, é o que garante que nenhuma delas fique
+ * de fora — hoje são quatro chamadores (fastify, express, adonis, generic-http) e o quinto que
+ * aparecer ganha o isolamento sem precisar lembrar de pedi-lo.
+ */
 export function runWithRequestContext<T>(snapshot: HttpRequestSnapshot, fn: () => T): T {
-  return storage.run(snapshot, fn);
+  return storage.run(snapshot, () => runWithScope(fn));
 }
 
 export function runWithRequestContextAsync<T>(snapshot: HttpRequestSnapshot, fn: () => Promise<T>): Promise<T> {
-  return storage.run(snapshot, fn);
+  return storage.run(snapshot, () => runWithScope(fn));
 }
 
 export function getRequestSnapshot(): HttpRequestSnapshot | undefined {

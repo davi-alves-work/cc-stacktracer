@@ -82,6 +82,7 @@ jobs:
               'README.md', 'LICENSE', 'CHANGELOG.md',
               'docs/client-installation-integration-playbook.md',
               'docs/client-payload-quality-checklist.md',
+              'docs/guides/subtenant.md',
               'cursor-rules/cc-stacktracer-core.mdc',
               'dist/index.js', 'dist/index.d.ts',
             ];

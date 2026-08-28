@@ -665,19 +665,51 @@ Full options and validation steps: `docs/client-distributed-tracing.md`.
 
 Use user context carefully.
 
-Current SDK user scope is process/global state. In request-based servers:
+**Since 2.2.0 the user scope is request-local** (AsyncLocalStorage), opened automatically by the
+HTTP integrations. Before 2.2.0 it was process-global, and `setUser()`/`tag()` from one request
+leaked into another request's events — if you are on an older version, upgrade before relying on
+either.
 
 - call `StackTrace.setUser(...)` only after authentication
-- set only safe identifiers
-- clear user context after the response
-- never set per-request tags
-- use static tags only for deploy/app identity
+- set only safe identifiers — id, tenant, hashed email; never raw email or name
+- `StackTrace.clearUser()` is no longer required for isolation; the scope ends with the request
+- per-request tags are safe now, and are the reason the leak mattered
+- outside a request (worker, script, boot) the old global still applies — that is the intended
+  fallback for single-shot processes
 
-Preferred static tags:
+Useful static tags at startup:
 
 - `app.product`
 - `stacktrace.integration`
 - `deployment.region`
+
+### Subtenant — one app, many customers
+
+If the same application serves N customers (a city-hall portal per municipality, a multi-company
+ERP), tag telemetry with `subtenant` so each one can be filtered apart inside the same project.
+
+**There is no `withSubtenant()`, `setSubtenant()`, or any scope API for this. Do not invent one by
+analogy with other SDKs — it does not exist and will throw at runtime.** It is an optional payload
+field, filled in on every send:
+
+```ts
+StackTrace.captureException(error, { subtenant: customer.slug });
+StackTrace.log('ticket filed', { subtenant: customer.slug });
+
+// Mind the argument order: withSpan(name, fn, options).
+await StackTrace.withSpan('process-ticket', () => service.process(data), {
+  attributes: { subtenant: customer.slug },
+});
+```
+
+For traces, **one span per request is enough**: the filter selects a trace when any span matches and
+then shows the whole trace, so the auto-instrumented HTTP root and DB spans come along even though
+they cannot carry the attribute.
+
+Use a readable slug (`pm-peruibe`), never an id — the value is displayed raw, and high cardinality
+trips the `subtenant_cardinality` audit check.
+
+Full guide: `docs/guides/subtenant.md`.
 
 For domain operations, use business context:
 

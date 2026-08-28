@@ -1,11 +1,15 @@
 {
   "name": "cc-stacktracer",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Observability SDK for Node.js — captures errors, structured logs, distributed traces and database spans, and ships them to a CC StackTracer ingestion API.",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=18"
+  },
+  "//redisMemoryServer": "O postinstall da lib compila o Redis do source, e a tag `stable` que ela baixa passou a trazer RediSearch/RedisJSON/RedisTimeSeries — cujo build exige um toolchain que nem o runner do CI nem as imagens Docker tem. Resultado: `npm ci` falhava em todo lugar. Ela e devDependency do ingestion-api e serve apenas ao script local `npm run redis:dev`, que baixa o binario sob demanda na primeira execucao. Desligar o postinstall nao tira funcionalidade nenhuma.",
+  "redisMemoryServer": {
+    "disablePostinstall": true
   },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -22,6 +26,7 @@
     "docs/client-universal-https-ingestion.md",
     "docs/client-onboarding-troubleshooting.md",
     "docs/client-distributed-tracing.md",
+    "docs/guides/subtenant.md",
     "cursor-rules"
   ],
   "exports": {

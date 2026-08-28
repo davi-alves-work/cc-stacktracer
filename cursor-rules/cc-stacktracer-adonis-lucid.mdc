@@ -246,28 +246,54 @@ Rules:
 
 ## 9) User Context in Adonis
 
-Because SDK user scope is global, request apps must handle cleanup.
+**Since 2.2.0 the user scope is request-local** — the Adonis middleware opens it per request, so
+one request's user can no longer surface in another's events.
 
 Rules:
 
 - call `StackTrace.setUser(...)` only after auth succeeds
 - set only safe identifiers
-- clear user context after the response or in middleware `finally`
-- do not use per-request tags
-- use static tags only at startup
+- `StackTrace.clearUser()` is optional now; the scope ends with the request
+- per-request tags are safe from 2.2.0 on
 
 Example pattern:
 
 ```ts
-try {
-  StackTrace.setUser({ id: user.id, tenantId: tenant.id });
-  await next();
-} finally {
-  StackTrace.clearUser();
-}
+// After auth resolved the user and the tenant:
+StackTrace.setUser({ id: user.id, tenantId: tenant.id });
+await next();
 ```
 
-If the SDK later uses request-local user context, update this rule, but keep cleanup explicit.
+On 2.1.x and earlier the scope was process-global and the `try/finally` with `clearUser()` was
+mandatory. Upgrade rather than keeping the workaround.
+
+### Subtenant — one app, many customers
+
+If the same application serves N customers (a city-hall portal per municipality, a multi-company
+ERP), tag telemetry with `subtenant` so each one can be filtered apart inside the same project.
+
+**There is no `withSubtenant()`, `setSubtenant()`, or any scope API for this. Do not invent one by
+analogy with other SDKs — it does not exist and will throw at runtime.** It is an optional payload
+field, filled in on every send:
+
+```ts
+StackTrace.captureException(error, { subtenant: customer.slug });
+StackTrace.log('ticket filed', { subtenant: customer.slug });
+
+// Mind the argument order: withSpan(name, fn, options).
+await StackTrace.withSpan('process-ticket', () => service.process(data), {
+  attributes: { subtenant: customer.slug },
+});
+```
+
+For traces, **one span per request is enough**: the filter selects a trace when any span matches and
+then shows the whole trace, so the auto-instrumented HTTP root and DB spans come along even though
+they cannot carry the attribute.
+
+Use a readable slug (`pm-peruibe`), never an id — the value is displayed raw, and high cardinality
+trips the `subtenant_cardinality` audit check.
+
+Full guide: `docs/guides/subtenant.md`.
 
 ---
 

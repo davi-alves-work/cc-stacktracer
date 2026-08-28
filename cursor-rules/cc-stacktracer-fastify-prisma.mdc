@@ -230,15 +230,46 @@ Duplicate captures:
 
 ## 7) User Context in Fastify
 
-Because SDK user scope is global, request apps must be careful:
+**Since 2.2.0 the user scope is request-local** — the Fastify plugin opens it per request:
 
 - call `StackTrace.setUser(...)` only after authentication succeeds
 - set safe identifiers only
 - include tenant/customer identifier only if safe and useful
-- call `StackTrace.clearUser()` in `onResponse`
-- do not use per-request tags
+- `StackTrace.clearUser()` in `onResponse` is no longer needed for isolation
+- per-request tags are safe from 2.2.0 on
 
 In unauthenticated public routes, do not set user context.
+
+On 2.1.x and earlier the scope was process-global, so the `onResponse` cleanup was mandatory and
+per-request tags leaked between requests.
+
+### Subtenant — one app, many customers
+
+If the same application serves N customers (a city-hall portal per municipality, a multi-company
+ERP), tag telemetry with `subtenant` so each one can be filtered apart inside the same project.
+
+**There is no `withSubtenant()`, `setSubtenant()`, or any scope API for this. Do not invent one by
+analogy with other SDKs — it does not exist and will throw at runtime.** It is an optional payload
+field, filled in on every send:
+
+```ts
+StackTrace.captureException(error, { subtenant: customer.slug });
+StackTrace.log('ticket filed', { subtenant: customer.slug });
+
+// Mind the argument order: withSpan(name, fn, options).
+await StackTrace.withSpan('process-ticket', () => service.process(data), {
+  attributes: { subtenant: customer.slug },
+});
+```
+
+For traces, **one span per request is enough**: the filter selects a trace when any span matches and
+then shows the whole trace, so the auto-instrumented HTTP root and DB spans come along even though
+they cannot carry the attribute.
+
+Use a readable slug (`pm-peruibe`), never an id — the value is displayed raw, and high cardinality
+trips the `subtenant_cardinality` audit check.
+
+Full guide: `docs/guides/subtenant.md`.
 
 ---
 

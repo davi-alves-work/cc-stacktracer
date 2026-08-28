@@ -4,6 +4,36 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-08-28
+
+### Fixed
+
+- **User and tag context no longer leak between concurrent requests.** `setUser()` and `tag()`
+  wrote to module-global state, so under concurrency a value set while handling request A could
+  be attached to events emitted for request B — data attributed to the wrong request. The scope is
+  now request-local (`AsyncLocalStorage`), opened automatically by the Fastify, Express, Adonis and
+  generic-HTTP integrations. Outside a request (worker, script, boot) the process-wide fallback
+  still applies, which is the intended behavior for single-shot processes.
+- **`setUser()` reached the server for the first time.** The normalizer classified `user` as an
+  unrecognized object and dropped it, so the call had no observable effect on any event. It now
+  maps to the canonical `metadata.user` block (`id`, `end_user_tenant`, `email_hash`). A `user`
+  without an `id` is ignored without failing the event.
+
+### Added
+
+- Optional `subtenant` field on the event metadata — the slice of *your* application (one customer
+  of a multi-tenant app), distinct from the platform `tenant_id` that identifies the API key owner.
+  Fill it in per send: `captureException(err, { subtenant })`, `log(msg, { subtenant })`, or
+  `withSpan(name, fn, { attributes: { subtenant } })`.
+
+  **No SDK API is involved and none is planned** — there is no `withSubtenant()`. The field already
+  travelled to the server on 2.1.0 as a tag, and the server reads both spellings, so upgrading is
+  not required to use it. See `docs/guides/subtenant.md`.
+
+### Changed
+
+- The three agent rule files no longer instruct manual `clearUser()` cleanup or forbid per-request
+  tags. Both existed only to work around the leak fixed above.
 ## [2.1.0] - 2026-07-22
 
 ### Changed

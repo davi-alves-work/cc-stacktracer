@@ -30,6 +30,8 @@ export { ResourceSchema } from './resource.schema.js';
 export { TagsSchema } from './tags.schema.js';
 export { ErrorSchema } from './error.schema.js';
 export { IngestionMetadataSchema, MetadataSchema } from './metadata.schema.js';
+export { UserSchema } from './user.schema.js';
+export type { UserMetadata } from './user.schema.js';
 export { segmentLooksLikeRawId, routeHasRawDynamicSegments, maskDynamicRouteSegments } from './route-validation.js';
 export { normalizeEventV4, eventV1ToV4, pickV3HttpRoute } from '../normalizers/normalize-event.js';
 export { normalizeHttpRouteForSpan } from '../normalizers/http-route-normalize.js';

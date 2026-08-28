@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 export type StackTraceScopeUser = {
@@ -7,11 +8,47 @@ export type StackTraceScopeUser = {
   emailHash?: string;
 };
 
-let currentUser: StackTraceScopeUser | undefined;
-const tags = new Map<string, string>();
+type ScopeState = {
+  /**
+   * `| undefined` explicito, e nao `user?:`. Com `exactOptionalPropertyTypes` ligado, a propriedade
+   * opcional nao aceita `undefined` como VALOR — e `clearUser()` precisa exatamente disso.
+   */
+  user: StackTraceScopeUser | undefined;
+  tags: Map<string, string>;
+};
+
+const storage = new AsyncLocalStorage<ScopeState>();
+
+/**
+ * Fallback fora de escopo. Existe para uso legítimo em processo single-shot (worker, script, boot),
+ * onde não há concorrência de requisição — um `tag('regiao', ...)` no boot precisa valer para tudo
+ * que o processo emitir.
+ *
+ * Até a 2.1.x este objeto ERA o único estado: `setUser()`/`tag()` da requisição A vazavam para os
+ * eventos da requisição B, entregando dado atribuído à requisição errada. O `AsyncLocalStorage`
+ * isola por requisição; o fallback ficou só para quem está fora de uma.
+ */
+const fallback: ScopeState = { user: undefined, tags: new Map() };
+
+function current(): ScopeState {
+  return storage.getStore() ?? fallback;
+}
 
 function hashEmail(email: string): string {
   return createHash('sha256').update(email.trim().toLowerCase()).digest('hex').slice(0, 16);
+}
+
+/**
+ * Abre um escopo isolado. Chamado uma vez por requisição, de dentro de `runWithRequestContext` —
+ * ver a nota lá sobre por que a composição vive num ponto só.
+ *
+ * O escopo nasce com uma CÓPIA das tags atuais: o que foi marcado no boot continua valendo dentro
+ * da requisição, mas o que a requisição marcar não volta para o fallback. Cópia, e não referência,
+ * é o que faz as duas metades dessa frase serem verdadeiras ao mesmo tempo.
+ */
+export function runWithScope<T>(fn: () => T): T {
+  const parent = current();
+  return storage.run({ user: parent.user, tags: new Map(parent.tags) }, fn);
 }
 
 /**
@@ -19,7 +56,7 @@ function hashEmail(email: string): string {
  * Email is never sent raw; an opaque hash is included when provided.
  */
 export function setUser(user: { id: string; email?: string; tenantId?: string }): void {
-  currentUser = {
+  current().user = {
     id: user.id,
     ...(user.tenantId !== undefined ? { tenantId: user.tenantId } : {}),
     ...(user.email !== undefined ? { emailHash: hashEmail(user.email) } : {}),
@@ -27,40 +64,42 @@ export function setUser(user: { id: string; email?: string; tenantId?: string })
 }
 
 export function clearUser(): void {
-  currentUser = undefined;
+  current().user = undefined;
 }
 
 export function tag(key: string, value: string): void {
-  tags.set(key, value);
+  current().tags.set(key, value);
 }
 
 export function setTags(record: Record<string, string>): void {
+  const state = current();
   for (const [k, v] of Object.entries(record)) {
-    tags.set(k, v);
+    state.tags.set(k, v);
   }
 }
 
 export function clearTags(): void {
-  tags.clear();
+  current().tags.clear();
 }
 
-/** For tests / process reset. */
+/** For tests / process reset. Limpa o fallback; escopos ativos morrem com o seu próprio ALS. */
 export function resetScopeMetadata(): void {
-  currentUser = undefined;
-  tags.clear();
+  fallback.user = undefined;
+  fallback.tags.clear();
 }
 
 export function getScopeContextForMerge(): Record<string, unknown> | undefined {
+  const state = current();
   const out: Record<string, unknown> = {};
-  if (currentUser !== undefined) {
+  if (state.user !== undefined) {
     out.user = {
-      id: currentUser.id,
-      ...(currentUser.tenantId !== undefined ? { tenantId: currentUser.tenantId } : {}),
-      ...(currentUser.emailHash !== undefined ? { emailHash: currentUser.emailHash } : {}),
+      id: state.user.id,
+      ...(state.user.tenantId !== undefined ? { tenantId: state.user.tenantId } : {}),
+      ...(state.user.emailHash !== undefined ? { emailHash: state.user.emailHash } : {}),
     };
   }
-  if (tags.size > 0) {
-    out.tags = Object.fromEntries(tags);
+  if (state.tags.size > 0) {
+    out.tags = Object.fromEntries(state.tags);
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
