@@ -55,8 +55,12 @@ function connectivityText(reason: ConnectivityReason): string {
   }
 }
 
-export function renderReport(report: DoctorReport, cwd: string): string[] {
-  const out: string[] = ['cc-stacktracer doctor', ''];
+export function renderReport(report: DoctorReport, cwd: string, endpoint?: string): string[] {
+  // O endpoint no cabecalho: apontar para staging sem perceber custa horas antes de alguem
+  // desconfiar da variavel de ambiente.
+  const header =
+    endpoint !== undefined && endpoint !== '' ? `cc-stacktracer doctor → ${endpoint}` : 'cc-stacktracer doctor';
+  const out: string[] = [header, `v${report.sdkVersion}`, ''];
 
   out.push('Stack');
   if (report.stack.empty) {

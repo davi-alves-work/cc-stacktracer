@@ -18,9 +18,15 @@
  */
 import { randomUUID } from 'node:crypto';
 import { signIngestionRequest } from '../core/transport/ingestion-signing.js';
+import { SDK_VERSION } from '../core/sdk-version.js';
+import type { SdkSpanRow } from '../core/span-payload.types.js';
+import type { EventV4 } from '../shared/schema/index.js';
 
 /** Marca dos dois envios. Filtrável no dashboard e reconhecível pelo suporte. */
 export const DOCTOR_SOURCE_TAG = 'cc-stacktracer-doctor';
+
+/** Duracao nominal do span sintetico. Precisa ser >0 e coerente com start_time/end_time. */
+const DOCTOR_SPAN_DURATION_MS = 1;
 
 export type ProbeInput = {
   endpoint: string;
@@ -56,40 +62,53 @@ function w3cIds(): { traceId: string; spanId: string } {
   return { traceId, spanId: traceId.slice(0, 16) };
 }
 
+/**
+ * Os dois corpos sao TIPADOS, e nao objetos livres.
+ *
+ * `EventSchemaV4` e `spanV4RowSchema` sao `.strict()`: campo faltando OU sobrando vira 400. Como
+ * este passo existe justamente para provar que a ingestao funciona, um payload errado aqui
+ * falharia para todo usuario, sempre — e foi o que aconteceu na 2.4.0. O tipo move a checagem para
+ * a compilacao.
+ *
+ * Os dois vocabularios diferem, e a diferenca nao e cosmetica: o evento usa `timestamp` e `service`
+ * (objeto); o span usa `span_timestamp`, `start_time`, `end_time` e `span_name`, e REJEITA
+ * `schema_version`.
+ */
 function eventsBody(input: ProbeInput, traceId: string, spanId: string, nowIso: string): string {
-  return JSON.stringify({
-    events: [
-      {
-        schema_version: 4,
-        type: 'log',
-        level: 'info',
-        message: `cc-stacktracer doctor: connectivity probe (${DOCTOR_SOURCE_TAG})`,
-        timestamp: nowIso,
-        service_id: input.serviceId,
-        trace: { trace_id: traceId, span_id: spanId },
-        metadata: { tags: { source: DOCTOR_SOURCE_TAG } },
-      },
-    ],
-  });
+  const event: EventV4 = {
+    schema_version: 4,
+    event_id: randomUUID(),
+    type: 'log',
+    level: 'info',
+    message: `cc-stacktracer doctor: connectivity probe (${DOCTOR_SOURCE_TAG})`,
+    timestamp: nowIso,
+    service_id: input.serviceId,
+    service: { name: DOCTOR_SOURCE_TAG, version: SDK_VERSION, environment: 'doctor' },
+    trace: { trace_id: traceId, span_id: spanId },
+    metadata: { tags: { source: DOCTOR_SOURCE_TAG } },
+  };
+  return JSON.stringify({ events: [event] });
 }
 
 function spansBody(input: ProbeInput, traceId: string, spanId: string, nowIso: string): string {
-  return JSON.stringify({
-    spans: [
-      {
-        schema_version: 4,
-        trace_id: traceId,
-        span_id: spanId,
-        name: 'cc-stacktracer.doctor.probe',
-        span_type: 'business',
-        status: 'ok',
-        timestamp: nowIso,
-        duration_us: 1000,
-        service_id: input.serviceId,
-        attributes: { source: DOCTOR_SOURCE_TAG },
-      },
-    ],
-  });
+  const endIso = new Date(Date.parse(nowIso) + DOCTOR_SPAN_DURATION_MS).toISOString();
+  const span: SdkSpanRow = {
+    span_timestamp: nowIso,
+    trace_id: traceId,
+    span_id: spanId,
+    service_id: input.serviceId,
+    service_name: DOCTOR_SOURCE_TAG,
+    service_version: SDK_VERSION,
+    environment: 'doctor',
+    span_name: 'cc-stacktracer.doctor.probe',
+    span_type: 'business',
+    status: 'ok',
+    start_time: nowIso,
+    end_time: endIso,
+    duration_us: DOCTOR_SPAN_DURATION_MS * 1000,
+    attributes: { source: DOCTOR_SOURCE_TAG },
+  };
+  return JSON.stringify({ spans: [span] });
 }
 
 async function post(

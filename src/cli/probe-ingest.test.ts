@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { EventSchemaV4 } from '../shared/schema/index.js';
 import { DOCTOR_SOURCE_TAG, probeIngest } from './probe-ingest.js';
 
 const base = {
   endpoint: 'https://ingest.example.com',
   apiKey: 'k-123',
-  serviceId: '33333333-3333-3333-3333-333333333333',
+  serviceId: '33333333-3333-4333-a333-333333333333',
 };
 
 const okRes = { ok: true, status: 202, text: async () => '' };
@@ -112,5 +113,49 @@ describe('probeIngest', () => {
     const fetchImpl = vi.fn().mockResolvedValue(okRes);
     await probeIngest({ ...base, endpoint: 'https://ingest.example.com/' }, fetchImpl as never);
     expect(String(fetchImpl.mock.calls[0]?.[0])).toBe('https://ingest.example.com/v1/events');
+  });
+});
+
+/**
+ * O teste que faltava, e que teria pego o defeito antes de a 2.4.0 sair.
+ *
+ * Os testes acima conferiam a MECANICA (dois endpoints, assinatura, dedupe) e nenhum conferia se o
+ * corpo casa com o contrato. Os dois schemas sao `.strict()`: campo faltando E campo sobrando dao
+ * 400, entao o passo que existe para provar a ingestao falharia para todo usuario, sempre.
+ */
+describe('payload sintetico contra o schema v4 real', () => {
+  const call = async (): Promise<{ events: unknown; spans: unknown }> => {
+    const fetchImpl = vi.fn().mockResolvedValue(okRes);
+    await probeIngest(base, fetchImpl as never);
+    const [ev, sp] = (fetchImpl.mock.calls as Call[]).map(
+      ([, init]) => JSON.parse(init.body) as Record<string, unknown>,
+    );
+    return { events: (ev?.events as unknown[])[0], spans: (sp?.spans as unknown[])[0] };
+  };
+
+  it('o log passa em EventSchemaV4', async () => {
+    const { events } = await call();
+    const r = EventSchemaV4.safeParse(events);
+    expect(r.success ? [] : r.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`)).toEqual([]);
+  });
+
+  // O span nao tem schema zod vendorizado no SDK — quem cobre e o tipo `SdkSpanRow`, em
+  // compilacao. Aqui conferimos o que o tipo nao alcanca: os nomes que o servidor EXIGE e os que
+  // ele REJEITA (o schema e `.strict()` dos dois lados).
+  it('o span usa o vocabulario que o servidor exige, e nenhum que ele rejeita', async () => {
+    const { spans } = await call();
+    const s = spans as Record<string, unknown>;
+    for (const req of ['span_timestamp', 'start_time', 'end_time', 'span_name', 'duration_us', 'service_id']) {
+      expect(s, `falta ${req}`).toHaveProperty(req);
+    }
+    for (const proibido of ['schema_version', 'timestamp', 'name']) {
+      expect(s, `${proibido} e rejeitado pelo schema estrito`).not.toHaveProperty(proibido);
+    }
+  });
+
+  it('duration_us bate com o intervalo start_time..end_time', async () => {
+    const { spans } = await call();
+    const s = spans as { start_time: string; end_time: string; duration_us: number };
+    expect(Date.parse(s.end_time) - Date.parse(s.start_time)).toBe(s.duration_us / 1000);
   });
 });

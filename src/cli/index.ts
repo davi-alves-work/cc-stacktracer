@@ -58,7 +58,7 @@ async function main(argv: string[]): Promise<number> {
     // Contrato de máquina: o `AGENTS.md` manda o assistente do cliente rodar e agir sobre isto.
     console.log(JSON.stringify(report, null, 2));
   } else {
-    console.log(renderReport(report, cwd).join('\n'));
+    console.log(renderReport(report, cwd, env.STACKTRACE_ENDPOINT).join('\n'));
   }
 
   return report.exitCode;

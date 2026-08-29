@@ -4,6 +4,28 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-08-29
+
+### Fixed
+
+- **`doctor` sent invalid payloads, so the step that proves ingestion works failed for everyone.**
+  Both synthetic bodies were rejected by the server: the log was missing `event_id` and `service`,
+  and the span was missing `span_timestamp`/`start_time`/`end_time` while carrying `schema_version`,
+  `name` and `timestamp` — which the schema rejects. Both schemas are strict, so a missing field
+  and an extra field are equally fatal.
+
+  The bodies are now typed as `EventV4` and `SdkSpanRow`, so the compiler catches both directions,
+  and three tests validate them against the real schema.
+
+  If you ran `doctor` on 2.4.0, the "Data path" step reported a 400 that was ours, not yours.
+
+### Changed
+
+- `doctor` prints the endpoint it is talking to, and the SDK version. Pointing at staging by
+  accident used to cost an hour before anyone suspected the environment variable.
+- `--json` output carries `sdkVersion`, so a CI consuming it can correlate a report with the
+  installed version.
+
 ## [2.4.0] - 2026-08-29
 
 ### Added

@@ -11,6 +11,7 @@
  * outra ferramenta, e misturar as duas transforma um comando de diagnóstico em algo que ninguém roda
  * sem medo.
  */
+import { SDK_VERSION } from '../core/sdk-version.js';
 import { checkConfig, type ConfigCheckResult } from './check-config.js';
 import { checkConnectivity, type ConnectivityResult } from './check-connectivity.js';
 import { detectStack, type DetectedStack, type PackageJsonLike } from './detect-stack.js';
@@ -28,6 +29,8 @@ export type DoctorDeps = {
 };
 
 export type DoctorReport = {
+  /** Versao do SDK que produziu este relatorio — o consumidor de `--json` precisa correlacionar. */
+  sdkVersion: string;
   stack: DetectedStack;
   config: ConfigCheckResult;
   /** `null` quando a etapa não rodou — config inválida torna o resultado sem sentido. */
@@ -51,6 +54,7 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
   const config = checkConfig(deps.env);
 
   const report: DoctorReport = {
+    sdkVersion: SDK_VERSION,
     stack,
     config,
     connectivity: null,
