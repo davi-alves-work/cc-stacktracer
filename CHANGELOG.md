@@ -4,6 +4,38 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-08-29
+
+### Added
+
+- **`npx cc-stacktracer doctor`** — diagnoses an installation without opening any documentation. It
+  detects the stack from your `package.json`, validates the three environment variables, tests
+  connectivity and credentials in one call, sends a synthetic log and span through the real
+  ingestion path, and prints the instrumentation gaps the server sees. `--json` for CI and coding
+  assistants; exit code `0` means the installation works.
+
+  Failures name the field that fixes them. A 404 from the API means the service id is wrong; a 404
+  from anything else means the endpoint is wrong — the two corrections are opposite, and until now
+  both reached support as "it does not work".
+
+  The synthetic send is a log plus a span, never an error: it exercises the same two endpoints and
+  the same HMAC signing, without leaving a fake incident in your `/errors`.
+
+- **Server-side instrumentation notices in the boot log.** When `capturePolicyRefreshMs` is on, the
+  server attaches what it sees about your instrumentation (missing spans, missing `service_version`,
+  route cardinality) to the capture policy, and the SDK prints each one **once per process**.
+
+- **`suppressServerNotices`** in `init`, to silence the above.
+
+- **`AGENTS.md`** in the package, with the full text in `docs/guides/agents.md` — neutral rules for
+  any coding assistant, not only Cursor.
+
+### Notes
+
+- The notices and the doctor both need the server side of this release in production. If
+  `doctor` reports the audit as unavailable, the platform has not been updated yet — the other
+  checks still apply.
+
 ## [2.3.0] - 2026-08-28
 
 ### Fixed

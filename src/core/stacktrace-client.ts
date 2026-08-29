@@ -6,6 +6,7 @@ import { parseStackTraceInit } from './config.schema.js';
 import { SDK_VERSION } from './sdk-version.js';
 import { CaptureGate } from '../observability/capture/CaptureGate.js';
 import { CapturePolicyCache } from '../observability/capture/CapturePolicyCache.js';
+import { createRuntimeNoticeReporter } from '../observability/capture/runtime-notices.js';
 import { getScopeContextForMerge } from './scope-metadata.js';
 import type { ServiceDescriptor, StackTraceEvent } from './stacktrace-event.types.js';
 import { toWirePayloadForIngest } from './wire-event.js';
@@ -101,6 +102,8 @@ export class StackTraceClient {
         ...(config.capturePolicyUrl !== undefined ? { capturePolicyUrl: config.capturePolicyUrl } : {}),
         ...(config.getHeaders !== undefined ? { getHeaders: config.getHeaders } : {}),
         ...(config.onTransportError !== undefined ? { onFetchError: config.onTransportError } : {}),
+        // O cache entrega os avisos; quem decide logar e deduplicar mora fora dele.
+        onNotices: createRuntimeNoticeReporter({ suppress: config.suppressServerNotices === true }),
       });
       this.captureGate = new CaptureGate({
         cache: this.capturePolicyCache,

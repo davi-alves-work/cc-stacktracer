@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { INSTRUMENTATION_CHECKS, INSTRUMENTATION_SEVERITIES } from './instrumentation-checks.js';
 
 /**
  * Event types (verbs) represent the kind of telemetry being evaluated (log, error, HTTP request, etc.).
@@ -54,11 +55,35 @@ const defaultCapturePartialSchema = z.object({
 });
 
 /** V2 wire shape stored in JSONB (and returned by APIs). */
+/**
+ * Avisos de instrumentacao que o servidor anexa a politica, para o SDK logar no boot.
+ *
+ * **A lista de codigos nunca e reescrita aqui** — vem de `INSTRUMENTATION_CHECKS`, o mesmo contrato
+ * que o audit usa para EMITIR. Escreve-la a mao foi o defeito C1: o enum nascia com 7 codigos
+ * enquanto o audit emitia 10, e `z.array()` e tudo-ou-nada — um unico codigo fora do enum reprova o
+ * array INTEIRO. Somando ao `safeParse` silencioso do lado do SDK, um serviço com
+ * `subtenant_cardinality` apagaria TODOS os avisos daquele ciclo, sem erro e sem sintoma.
+ */
+export const capturePolicyNoticeSchema = z
+  .object({
+    code: z.enum(INSTRUMENTATION_CHECKS),
+    severity: z.enum(INSTRUMENTATION_SEVERITIES),
+    params: z.record(z.string(), z.union([z.string(), z.number()])).default({}),
+  })
+  .strict();
+
+export type CapturePolicyNotice = z.infer<typeof capturePolicyNoticeSchema>;
+
+/** Teto de avisos por resposta: o log de boot e um bloco, nao um relatorio. */
+export const CAPTURE_POLICY_MAX_NOTICES = 20;
+
 export const capturePolicyV2WireSchema = z
   .object({
     enabled: z.boolean(),
     defaultCapture: defaultCapturePartialSchema.optional(),
     rules: z.array(captureRuleSchema).max(CAPTURE_POLICY_MAX_RULES).optional(),
+    /** Aditivo e opcional: SDK antigo ignora, servidor novo nao quebra cliente velho. */
+    notices: z.array(capturePolicyNoticeSchema).max(CAPTURE_POLICY_MAX_NOTICES).optional(),
   })
   .strict();
 

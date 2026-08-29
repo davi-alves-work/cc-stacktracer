@@ -1,6 +1,6 @@
 # Subtenant — filtrar telemetria por cliente da sua aplicação
 
-Se a sua aplicação é a mesma para N clientes — uma ouvidoria que atende dezenas de municípios, um ERP
+Se a sua aplicação é a mesma para N clientes — um helpdesk que atende dezenas de unidades, um ERP
 multi-empresa, um SaaS com contas isoladas — o `subtenant` é o campo que separa a telemetria de cada
 um deles dentro do mesmo projeto.
 
@@ -11,7 +11,7 @@ São dois recortes diferentes, e só um é seu:
 | Campo | O que é | Quem preenche |
 |---|---|---|
 | `tenant_id` | A organização dona da API key — **você**, o cliente da plataforma | O servidor, a partir da API key. Você nunca envia |
-| `subtenant` | O cliente **da sua aplicação** — a "PM Peruíbe" dentro da "Ouvidoria" | Você, em cada envio |
+| `subtenant` | O cliente **da sua aplicação** — a "PM Demo" dentro do "Helpdesk" | Você, em cada envio |
 
 ## Não existe API para isto
 
@@ -78,13 +78,13 @@ aparece sem o campo.
 ## Use slug, não id
 
 ```ts
-{ subtenant: 'pm-peruibe' }                              // ✅
+{ subtenant: 'pm-demo' }                              // ✅
 { subtenant: 'f2418f5f-c776-4a1e-9c3d-2b8e4a91d077' }    // ❌
 ```
 
 Dois motivos:
 
-1. **O valor aparece cru** no seletor de filtro e nas telas. `pm-peruibe` é legível; um UUID é um
+1. **O valor aparece cru** no seletor de filtro e nas telas. `pm-demo` é legível; um UUID é um
    enigma para quem está olhando o painel.
 2. **Cardinalidade.** A coluna é otimizada para poucos valores distintos. Slug de município fica nas
    centenas e vai bem. Id de registro, de sessão ou de usuário estoura — e a auditoria de

@@ -1,6 +1,8 @@
 import {
   DEFAULT_COMPILED_CAPTURE_POLICY,
+  capturePolicyNoticeSchema,
   parseAndCompileCapturePolicy,
+  type CapturePolicyNotice,
   type CompiledCapturePolicy,
 } from '../../shared/schema/index.js';
 import { buildCapturePolicyServiceIdKey } from './policy-key.js';
@@ -15,6 +17,13 @@ export type CapturePolicyCacheOptions = {
   refreshMs: number;
   getHeaders?: (() => Record<string, string>) | undefined;
   onFetchError?: ((err: unknown) => void) | undefined;
+  /**
+   * Avisos de instrumentacao vindos do servidor.
+   *
+   * O cache entrega; QUEM decide logar, deduplicar e formatar fica fora — um cache nao deve saber
+   * o que e um logger. Ver `runtime-notices.ts`.
+   */
+  onNotices?: ((notices: CapturePolicyNotice[]) => void) | undefined;
   /** Test hook; defaults to Math.random. */
   random?: (() => number) | undefined;
 };
@@ -142,6 +151,10 @@ export class CapturePolicyCache {
           ? (json as { data: { capturePolicy?: unknown } }).data
           : undefined;
       const raw = data?.capturePolicy;
+      // ANTES do parse da politica: `parseAndCompileCapturePolicy` monta um objeto so com `enabled`,
+      // `defaultCapture` e `rules` — e por isso que SDK antigo ignora `notices` sem cair no default,
+      // mas tambem por isso o SDK novo nao o veria por aquele caminho.
+      this.emitNotices(raw);
       const policy = parseAndCompileCapturePolicy(raw);
       this.policies = new Map([[this.policyKey, policy]]);
       this.failureCount = 0;
@@ -155,5 +168,24 @@ export class CapturePolicyCache {
         this.scheduleNext(nextDelayMs);
       }
     }
+  }
+
+  /**
+   * Extrai os avisos sem NUNCA deixar que uma falha aqui derrube a politica: aviso malformado que
+   * impedisse o refresh faria o SDK cair no default permissivo e capturar o que o cliente mandou
+   * descartar — o oposto do que os avisos existem para fazer.
+   */
+  private emitNotices(raw: unknown): void {
+    if (this.opts.onNotices === undefined) return;
+    const list = (raw as { notices?: unknown } | null | undefined)?.notices;
+    if (!Array.isArray(list)) return;
+    const parsed: CapturePolicyNotice[] = [];
+    for (const item of list) {
+      // Elemento a elemento, e nao o array inteiro: `z.array()` e tudo-ou-nada, e um codigo mais
+      // novo que esta versao do SDK apagaria TODOS os avisos daquele ciclo.
+      const one = capturePolicyNoticeSchema.safeParse(item);
+      if (one.success) parsed.push(one.data);
+    }
+    if (parsed.length > 0) this.opts.onNotices(parsed);
   }
 }

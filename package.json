@@ -1,6 +1,6 @@
 {
   "name": "cc-stacktracer",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Observability SDK for Node.js — captures errors, structured logs, distributed traces and database spans, and ships them to a CC StackTracer ingestion API.",
   "license": "MIT",
   "type": "module",
@@ -19,6 +19,7 @@
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
+    "AGENTS.md",
     "docs/client-installation-integration-playbook.md",
     "docs/client-payload-quality-checklist.md",
     "docs/client-node-tgz-installation.md",
@@ -26,6 +27,7 @@
     "docs/client-universal-https-ingestion.md",
     "docs/client-onboarding-troubleshooting.md",
     "docs/client-distributed-tracing.md",
+    "docs/guides/agents.md",
     "docs/guides/subtenant.md",
     "cursor-rules"
   ],
@@ -70,6 +72,9 @@
       "import": "./dist/plugin-sdk.js",
       "default": "./dist/plugin-sdk.js"
     }
+  },
+  "bin": {
+    "cc-stacktracer": "./dist/cli/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

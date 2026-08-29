@@ -55,6 +55,14 @@ export type StackTraceInitOptions = {
   /** Full URL for capture-policy GET; default `${endpoint}/ingest/capture-policy?serviceId`. */
   capturePolicyUrl?: string;
   /**
+   * Silences the instrumentation notices the server attaches to the capture policy.
+   *
+   * The notices are logged once per code, at boot, and only when `capturePolicyRefreshMs` is on.
+   * Unsolicited logging in production is irritating enough that the opt-out is mandatory, not a
+   * nice-to-have.
+   */
+  suppressServerNotices?: boolean;
+  /**
    * Optional legacy scope override. Modern ingestion resolves tenant/project from the API key
    * and does not require clients to configure these values.
    */

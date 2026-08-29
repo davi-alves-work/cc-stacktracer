@@ -82,9 +82,13 @@ jobs:
               'README.md', 'LICENSE', 'CHANGELOG.md',
               'docs/client-installation-integration-playbook.md',
               'docs/client-payload-quality-checklist.md',
+              'AGENTS.md', 'docs/guides/agents.md',
               'docs/guides/subtenant.md',
               'cursor-rules/cc-stacktracer-core.mdc',
               'dist/index.js', 'dist/index.d.ts',
+              // O CLI e o motivo do `bin`: sem ele `npx cc-stacktracer doctor` quebra em runtime,
+              // e o pipeline passaria verde ate o primeiro cliente rodar o comando.
+              'dist/cli/index.js',
             ];
             const missing = required.filter(r => !files.includes(r));
             if (missing.length) {

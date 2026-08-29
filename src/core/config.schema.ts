@@ -86,6 +86,9 @@ export const stackTraceInitSchema = z
     release: z.string().min(1).max(256).optional(),
     capturePolicyRefreshMs: z.number().int().min(0).optional(),
     capturePolicyUrl: z.string().min(1).max(2048).optional(),
+    /** Sem default: `undefined` e `false` significam a mesma coisa aqui, e um default explicito
+     *  so criaria uma terceira forma de dizer 'nao silencie'. */
+    suppressServerNotices: z.boolean().optional(),
     tenantId: z.string().uuid().optional(),
     projectId: z.string().uuid().optional(),
   })

@@ -43,6 +43,8 @@ export {
   captureEventTypeSchema,
   capturePolicyLegacyWireSchema,
   capturePolicyV2WireSchema,
+  capturePolicyNoticeSchema,
+  CAPTURE_POLICY_MAX_NOTICES,
   captureRuleSchema,
   compileCapturePolicy,
   compileCapturePolicyFromRawOrNull,
@@ -62,8 +64,13 @@ export type {
   CaptureEventType,
   CapturePolicyLegacyWire,
   CapturePolicyV2Wire,
+  CapturePolicyNotice,
   CaptureRule,
   CompiledCapturePolicy,
   CompiledCaptureRule,
   EvaluateCaptureOptions,
 } from './capture-policy-engine.js';
+
+/** Contrato dos codigos de check da auditoria de instrumentacao (ver instrumentation-checks.ts). */
+export { INSTRUMENTATION_CHECKS, INSTRUMENTATION_SEVERITIES } from './instrumentation-checks.js';
+export type { InstrumentationCheck, InstrumentationSeverity } from './instrumentation-checks.js';

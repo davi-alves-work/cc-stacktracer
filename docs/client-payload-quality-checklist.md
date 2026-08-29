@@ -1,6 +1,6 @@
 # Checklist de qualidade de payload — integração cc-stacktracer
 
-Checklist operacional derivado de auditoria real (projeto **holerite-web**, maio/2026).
+Checklist operacional derivado de auditoria real (projeto **payroll-web**, maio/2026).
 Use em onboarding de novos clientes e em revisões periódicas da integração.
 
 **Documento relacionado:** [client-installation-integration-playbook.md](./client-installation-integration-playbook.md) (gate de go-live: **§19**; referência de campos: **§20**)
@@ -31,7 +31,7 @@ Use em onboarding de novos clientes e em revisões periódicas da integração.
 
 ## A) Rodar no cliente (app integradora)
 
-Responsável: time da aplicação (ex.: HoleriteWeb). Referência: playbook de instalação + este checklist.
+Responsável: time da aplicação (ex.: PayrollApp). Referência: playbook de instalação + este checklist.
 
 > A plataforma **mitiga** rotas cruas e preenche correlation em parte dos casos (SDK ALS), mas **não substitui** template Fastify, status HTTP real no handler nem `release` no init.
 
@@ -40,7 +40,7 @@ Responsável: time da aplicação (ex.: HoleriteWeb). Referência: playbook de i
 | ID | P | Item | Validação | Status |
 |----|---|------|-----------|--------|
 | ID-01 | P0 | `STACKTRACE_SERVICE_ID` = UUID do dashboard (`/services`) | Init com UUID válido | [ ] |
-| ID-03 | P1 | `service` legível no `init` (ex.: `holerite-web`) | JSON não mostra só `service-ce3b46e5` | [ ] |
+| ID-03 | P1 | `service` legível no `init` (ex.: `payroll-web`) | JSON não mostra só `service-a1b2c3d4` | [ ] |
 | ID-04 | P1 | `release` / `STACKTRACE_RELEASE` no init | Spans sem `service_version: "unknown"` nem `"0.0.0"` quando há build real | [ ] |
 | ID-05 | P2 | Handoff: nome no dashboard pode mudar; histórico no mesmo `serviceId` | Doc interno | [ ] |
 
@@ -79,7 +79,7 @@ Responsável: time da aplicação (ex.: HoleriteWeb). Referência: playbook de i
 ```json
 "http": {
   "method": "GET",
-  "route": "/api/holerites/:matricula/indicadores",
+  "route": "/api/payroll/:employeeId/indicators",
   "status_code": 500,
   "duration_ms": 842
 },
@@ -91,7 +91,7 @@ Responsável: time da aplicação (ex.: HoleriteWeb). Referência: playbook de i
 | ID | P | Item | Validação | Status |
 |----|---|------|-----------|--------|
 | SP-01 | P0 | `http_route` com `:param`, não ID cru | Tabela `spans` | [ ] |
-| SP-02 | P0 | Span DB com nome semântico (`folha.recibo.*`) | Nome estável | [ ] |
+| SP-02 | P0 | Span DB com nome semântico (`payroll.receipt.*`) | Nome estável | [ ] |
 | SP-03 | P0 | `trace_id` / `parent_span_id` ligam HTTP → filhos | Waterfall completo | [ ] |
 | SP-05 | P1 | `service_version` ≠ `"unknown"` | `release` no init | [ ] |
 | SP-06 | P1 | `metadata` de negócio em fluxos críticos | `metadata_json` útil nos spans HTTP/DB | [ ] |
@@ -132,7 +132,7 @@ Após pull/build: `npm run build` (SDK) e `npm run build:ingestion` (API/worker)
 | ID | P | Item | Validação | Status | Implementação (referência) |
 |----|---|------|-----------|--------|---------------------------|
 | ID-02 | P0 | `service_id` canônico; `service_name` do cadastro no dashboard | Joins por UUID | [x] | `ingestion-api/src/services/service-resolver.ts` (`findServiceInProject`); persist usa `service.name` do Postgres |
-| SP-04 | P0 | Spans/events: `service_name` resolvido no persist, não do payload | DB ≠ `service-ce3b46e5` | [x] | `ingestion-api/src/workers/persist-span-batch.ts` (`resolveSpanServices` → `serviceName` do cadastro); `persist-ingest-message.ts` (`serviceName: service.name`) |
+| SP-04 | P0 | Spans/events: `service_name` resolvido no persist, não do payload | DB ≠ `service-a1b2c3d4` | [x] | `ingestion-api/src/workers/persist-span-batch.ts` (`resolveSpanServices` → `serviceName` do cadastro); `persist-ingest-message.ts` (`serviceName: service.name`) |
 | PLAT-01 | P0 | Schema v3: `metadata.http` com `scheme`, `client.address`, `user_agent.original` | Testes shared | [x] | `packages/shared/schema/http.schema.ts`; merge v1 em `normalize.ts` / `v1HttpToV3` |
 | PLAT-02 | P0 | `metadata.correlation` preservado na normalização v1→v3 | Testes shared | [x] | `MetadataSchema.correlation`; `eventV1ToV3` + `v1MetadataToCorrelation`; teste `preserves metadata.correlation` em `event-v3.test.ts` |
 | PLAT-03 | P0 | `pickV3HttpRoute`: mascara IDs crus; fallback por `url`; menos `/unnormalized` | Testes `event-v3` | [x] | `packages/shared/schema/route-validation.ts` (`maskDynamicRouteSegments`); `pickV3HttpRoute` em `normalize-event.ts` |
@@ -218,7 +218,7 @@ WHERE e.event_type = 'error' ORDER BY e.received_at DESC LIMIT 1;
 - [x] Spans: `service_name` = nome cadastrado no dashboard
 - [x] Ingest aceita `metadata.http` com `scheme`, `client`, `user_agent.original`
 - [x] Rotas com só IDs numéricos normalizadas para `:id` quando cliente não envia template
-- [ ] End-to-end holerite-web: depende dos itens P0 da seção A
+- [ ] End-to-end payroll-web: depende dos itens P0 da seção A
 
 ---
 
@@ -230,7 +230,7 @@ WHERE e.event_type = 'error' ORDER BY e.received_at DESC LIMIT 1;
 | 2026-05-27 | Plataforma | PLAT-01, PLAT-02 | Schema v3 HTTP + correlation | [ ] |
 | 2026-05-27 | Plataforma | PLAT-03…06 | Máscara rota, ALS correlation, stack sanitize, `captureError` | [ ] |
 | 2026-05-27 | Entrega | `.tgz` | `artifacts/releases/cc-stacktracer-0.2.0/cc-stacktracer-0.2.0.tgz` | [ ] |
-| | Cliente | Seção A (P0) | HoleriteWeb — pendente | [ ] |
+| | Cliente | Seção A (P0) | PayrollApp — pendente | [ ] |
 
 ---
 
@@ -238,7 +238,7 @@ WHERE e.event_type = 'error' ORDER BY e.received_at DESC LIMIT 1;
 
 | Data | Notas |
 |------|-------|
-| 2026-05-27 | Checklist criado (auditoria holerite-web). |
+| 2026-05-27 | Checklist criado (auditoria payroll-web). |
 | 2026-05-27 | Split cliente vs plataforma. |
 | 2026-05-27 | Plataforma: implementação PLAT-01…06 + ID-02/SP-04; `.tgz` republicado; checklist atualizado com referências de código. |
 | 2026-06-25 | Playbook §19 (integration quality defaults); checklist: ERR-08/09, SP-08/09, DASH-01; validação ClickHouse. |
