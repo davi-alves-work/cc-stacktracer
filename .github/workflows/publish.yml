@@ -86,8 +86,8 @@ jobs:
               'docs/guides/subtenant.md',
               'cursor-rules/cc-stacktracer-core.mdc',
               'dist/index.js', 'dist/index.d.ts',
-              // O CLI e o motivo do `bin`: sem ele `npx cc-stacktracer doctor` quebra em runtime,
-              // e o pipeline passaria verde ate o primeiro cliente rodar o comando.
+              // Sem isto o pipeline passaria verde ate o primeiro cliente rodar o comando do bin.
+              // (Nada de crase aqui: o script vive dentro de node -e ''...'' e o shell as executaria.)
               'dist/cli/index.js',
             ];
             const missing = required.filter(r => !files.includes(r));
