@@ -4,6 +4,36 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-08-28
+
+### Fixed
+
+- **Stack traces no longer destroy your own frames while leaking the host path through library
+  ones.** `sanitizeStackTrace` redacted any frame under `/Users`, `/home`, `/var`, `/tmp` or
+  `/opt`, and every Windows path, replacing it with `(...)` — while preserving `node_modules`
+  frames in full. In a single stack that produced:
+
+  ```
+  at createOrder (...)                                                 ← file and line lost
+  at handler (/home/deploy/app/node_modules/fastify/lib/route.js:210)  ← /home/deploy/app leaked
+  ```
+
+  It threw away what a developer needs and failed at the privacy goal it existed for, because the
+  host prefix escaped through the library frame right below. The outcome also depended on the
+  deployment layout: under `/app` or `/srv/app` (Docker defaults) application frames survived;
+  under `/home` or `/var/www` they did not. On Windows nothing survived.
+
+  Frames are now rewritten **relative to the application root** — `src/orders.ts:42:11`,
+  `node_modules/fastify/lib/route.js:210:5`. The host layout is gone from *every* frame, no frame
+  loses its file and line, and path separators are normalized to `/` so the same tooling works on
+  Windows and Unix. An absolute path outside the application root is still redacted: that is
+  precisely the host layout this function exists to hide.
+
+### Changed
+
+- `sanitizeStackTrace(stack)` now accepts an optional second argument,
+  `{ appRoot?: string | null }`. It defaults to `process.cwd()`, and `null` disables relativization
+  (everything absolute is redacted). Existing single-argument calls are unaffected.
 ## [2.2.0] - 2026-08-28
 
 ### Fixed
