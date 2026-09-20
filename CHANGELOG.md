@@ -4,6 +4,45 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-09-19
+
+### Fixed
+
+- **Events emitted outside a trace arrived with a made-up `trace_id`.** With no active context,
+  the SDK rolled a random id — and on the batch path, a single random id was pasted onto EVERY
+  untraced event in that flush, stitching unrelated events into one fake shared trace. In practice
+  the event landed in the database looking correlated while pointing at a trace that never
+  existed; the trace's "Correlated events" tab came up empty with no signal as to why.
+
+  An untraced event now ships with the W3C all-zero ids (`0000…`), which the platform stores as
+  `NULL`. An orphan event is now countable, and the instrumentation panel warns when a service
+  crosses 25% of them.
+
+- **A log or error emitted outside an HTTP request received no correlation at all**, even inside
+  an active trace: the trace block was only built when an HTTP snapshot existed. Jobs, consumers,
+  crons and CLIs now correlate correctly.
+
+- **A `traceparent` with an all-zero trace-id or parent-id was accepted.** The W3C spec declares
+  these invalid; they are now rejected, and the request opens a new trace instead of inheriting an
+  invalid id.
+
+### Added
+
+- **`withTrace(name, fn, options?)`** — opens a trace for entry points that are not HTTP. Without
+  it, `withSpan` inside a job was a silent no-op: with no active trace, no span was ever emitted.
+
+- **`captureErrors`** on the Fastify and Adonis plugins, and `stacktraceErrorMiddleware()` on
+  Express: captures the error that reaches the boundary as an event, already inside the request's
+  and trace's context. **Defaults to `false`** — enabling it on an application that already
+  captures in its own error handler would duplicate every occurrence.
+
+### Changed
+
+- `x-request-id` / `x-correlation-id` no longer act as a source for `trace_id`. Since they are
+  almost never 32-hex, the normalizer used to discard them and roll a random id instead — the
+  branch never actually delivered correlation. The value still flows into
+  `metadata.correlation.requestId` and into the `request_id` column.
+
 ## [2.4.1] - 2026-08-29
 
 ### Fixed

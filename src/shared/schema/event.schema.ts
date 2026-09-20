@@ -4,7 +4,7 @@ import { ServiceSchema } from './service.schema.js';
 export { iso8601TimestampSchema } from './timestamp.schema.js';
 export { ServiceSchema } from './service.schema.js';
 
-const MAX_DB_STATEMENT = 500;
+const MAX_DB_STATEMENT = 4000;
 
 export const TraceSchema = z.object({
   trace_id: z.string().min(1).max(256),

@@ -41,6 +41,8 @@ export const INSTRUMENTATION_CHECKS = [
   'route_cardinality',
   /** Subtenants demais: o campo provavelmente recebeu id de usuário ou de requisição. */
   'subtenant_cardinality',
+  /** Logs/erros chegam sem `trace_id` — não aparecem no trace a que pertencem. */
+  'events_untraced',
   /** Nada a corrigir. É finding de verdade, com severidade `ok` — não a ausência de findings. */
   'ok',
 ] as const;

@@ -10,15 +10,40 @@ import { headersToRecord } from '../utils/headers.js';
 import { redactUrl } from '../utils/redact-url.js';
 import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { httpRootSpanOutcome } from './http-root-span-outcome.js';
+import { captureBoundaryError, type BoundaryCaptureOptions } from './capture-boundary-error.js';
 
 export type StacktraceExpressOptions = {
   /** Override for tests; defaults to singleton from init(). */
   client?: StackTraceClient | null;
+  /**
+   * @deprecated Não tem efeito aqui. O Express não tem hook de erro — registre
+   * `stacktraceErrorMiddleware({ captureErrors: true })` DEPOIS das rotas.
+   */
+  captureErrors?: never;
 };
 
 function getClient(opts: StacktraceExpressOptions | undefined): StackTraceClient | null {
   if (opts?.client !== undefined) return opts.client;
   return getStackTraceClient();
+}
+
+let warnedAboutIneffectiveCaptureErrors = false;
+
+/**
+ * `captureErrors` tipado como `never` barra o literal de objeto no TypeScript, mas o excess-property
+ * check do TS não pega passagem por variável — perfil comum em base Express legada, muitas vezes sem
+ * TypeScript algum. Este aviso, emitido uma vez por processo (não a cada requisição), cobre esse caso.
+ */
+function warnIfCaptureErrorsPassed(opts: StacktraceExpressOptions | undefined): void {
+  if (warnedAboutIneffectiveCaptureErrors) return;
+  const raw = opts as { captureErrors?: unknown } | undefined;
+  if (raw?.captureErrors !== undefined) {
+    warnedAboutIneffectiveCaptureErrors = true;
+    console.warn(
+      'cc-stacktracer: stacktraceExpressMiddleware({ captureErrors }) não tem efeito — o Express não tem ' +
+        'hook de erro. Registre stacktraceErrorMiddleware({ captureErrors: true }) DEPOIS das rotas.',
+    );
+  }
 }
 
 function expressMatchedRoute(req: Request): string | undefined {
@@ -34,6 +59,7 @@ function expressMatchedRoute(req: Request): string | undefined {
 export function stacktraceExpressMiddleware(
   opts?: StacktraceExpressOptions,
 ): (req: Request, res: Response, next: NextFunction) => void {
+  warnIfCaptureErrorsPassed(opts);
   return (req: Request, res: Response, next: NextFunction) => {
     const start = Date.now();
     const startIso = new Date(start).toISOString();
@@ -101,5 +127,22 @@ export function stacktraceExpressMiddleware(
         correlation.traceFlags,
       );
     });
+  };
+}
+
+/**
+ * Error middleware do Express. Registre-o DEPOIS das rotas:
+ * `app.use(stacktraceErrorMiddleware({ captureErrors: true }))`.
+ *
+ * É um registro explícito porque o Express não tem hook de erro: a assinatura de 4 argumentos é o único
+ * jeito de ver a exceção. Ele roda dentro da cadeia aberta por `stacktraceExpressMiddleware`, então o
+ * AsyncLocalStorage de requisição e de trace ainda está ativo — é isso que faz o evento sair correlacionado.
+ */
+export function stacktraceErrorMiddleware(
+  opts: BoundaryCaptureOptions = {},
+): (err: unknown, req: Request, res: Response, next: NextFunction) => void {
+  return (err: unknown, _req: Request, _res: Response, next: NextFunction): void => {
+    captureBoundaryError(err, opts);
+    next(err);
   };
 }

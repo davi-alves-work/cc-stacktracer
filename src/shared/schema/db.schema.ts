@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-const MAX_STATEMENT = 500;
+const MAX_STATEMENT = 4000;
 
 /**
  * Database operation — enables slow-query grouping and system breakdowns.

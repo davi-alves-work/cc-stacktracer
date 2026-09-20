@@ -528,4 +528,37 @@ describe('StackTraceClient', () => {
 
     await client.shutdown();
   });
+
+  it('no mesmo lote, evento com trace mantém o seu e evento sem trace recebe a sentinela', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal('fetch', fetchMock);
+    const config = parseStackTraceInit({
+      apiKey: 'k',
+      serviceId,
+      service: 'svc',
+      environment: 'prod',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'batch',
+    });
+    const client = new StackTraceClient(config);
+    client.enqueue({
+      ...minimalLog('com trace'),
+      context: { trace: { trace_id: '74655e3589e4205969440ccdc13a3b12' } },
+    });
+    client.enqueue(minimalLog('sem trace'));
+    await client.flush();
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const events = fetchMock.mock.calls.flatMap((call) => {
+      const init = call[1] as RequestInit;
+      return (
+        JSON.parse(init.body as string) as {
+          events: Array<{ message: string; trace: { trace_id: string } }>;
+        }
+      ).events;
+    });
+    expect(events).toHaveLength(2);
+    expect(events.find((e) => e.message === 'com trace')?.trace.trace_id).toBe('74655e3589e4205969440ccdc13a3b12');
+    expect(events.find((e) => e.message === 'sem trace')?.trace.trace_id).toBe('00000000000000000000000000000000');
+  });
 });

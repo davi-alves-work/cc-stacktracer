@@ -7,6 +7,7 @@ import {
   getTraceIdFromContext,
   popActiveSpan,
   pushActiveSpan,
+  runWithTraceContext,
 } from './trace-span-context.js';
 import { getBusinessContext } from './business-context.js';
 
@@ -178,6 +179,59 @@ export async function withSpan<T>(name: string, fn: () => Promise<T> | T, option
   } finally {
     popActiveSpan();
   }
+}
+
+/**
+ * Abre um trace para um ponto de entrada que NÃO é HTTP — job, consumer de fila, cron, CLI — e emite o
+ * span raiz ao fim.
+ *
+ * Sem isto, esses pontos de entrada não produziam telemetria nenhuma: `buildRow` devolve `null` quando
+ * não há trace ativo, então `withSpan` dentro de um job era um no-op silencioso, e os logs do job saíam
+ * sem correlação.
+ *
+ * Dentro de um trace já ativo, delega para {@link withSpan}: um job disparado de dentro de uma requisição
+ * pertence ao trace DELA, e abrir um segundo trace partiria a história em duas.
+ */
+export async function withTrace<T>(name: string, fn: () => Promise<T> | T, options?: SpanOptions): Promise<T> {
+  if (getTraceIdFromContext() !== undefined) {
+    return withSpan(name, fn, options);
+  }
+  const traceId = randomBytes(16).toString('hex');
+  const rootSpanId = newSpanId();
+  const startIso = new Date().toISOString();
+  const perfStart = performance.now();
+  // Spread first, then apply the default: guards against a `type: undefined` explicitly present on
+  // `options` clobbering the default. `exactOptionalPropertyTypes` blocks that from typed call sites,
+  // but this keeps the merge correct regardless of how `options` was produced.
+  const spanOptions: SpanOptions = { ...options, type: options?.type ?? 'service' };
+
+  const finish = (err?: Error): void => {
+    const row = buildRow({
+      name,
+      spanId: rootSpanId,
+      parentSpanId: null,
+      startIso,
+      endIso: new Date().toISOString(),
+      durationUs: (performance.now() - perfStart) * 1000,
+      traceId,
+      options: spanOptions,
+      ...(err !== undefined ? { err } : {}),
+    });
+    if (row !== null) {
+      getSdkRuntime().client?.enqueueSpan(row);
+    }
+  };
+
+  return runWithTraceContext(traceId, rootSpanId, async () => {
+    try {
+      const out = await Promise.resolve(fn());
+      finish();
+      return out;
+    } catch (err) {
+      finish(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+  });
 }
 
 export function startSpan(name: string, options?: SpanOptions): SpanHandle {

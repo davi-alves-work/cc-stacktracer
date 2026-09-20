@@ -8,6 +8,7 @@ import {
   runWithRequestContext,
   runWithRequestContextAsync,
 } from './request-context.js';
+import { pushActiveSpan, runWithTraceContext } from './trace-span-context.js';
 
 const snapshot = {
   method: 'POST',
@@ -91,6 +92,50 @@ describe('request context', () => {
         );
         expect(e.trace.trace_id).toBe('0af7651916cd43dd8448eb211c80319c');
         expect(e.trace.parent_span_id).toBe('00f067aa0ba902b7');
+      },
+    );
+  });
+});
+
+describe('trace fora de requisição HTTP', () => {
+  it('mergeEventContext leva o trace do ALS quando não há snapshot HTTP', () => {
+    runWithTraceContext('0af7651916cd43dd8448eb211c80319c', 'aaaaaaaaaaaaaaaa', () => {
+      const m = mergeEventContext();
+      expect(m?.trace).toEqual({
+        trace_id: '0af7651916cd43dd8448eb211c80319c',
+        span_id: 'aaaaaaaaaaaaaaaa',
+      });
+      expect(m?.http).toBeUndefined();
+    });
+  });
+
+  it('sem ALS e sem snapshot não inventa bloco de trace', () => {
+    expect(mergeEventContext()?.trace).toBeUndefined();
+  });
+
+  it('com snapshot HTTP e ALS de trace ativos juntos, o trace do ALS vence o traceparent do header', () => {
+    runWithRequestContext(
+      {
+        method: 'GET',
+        url: '/x',
+        headers: {
+          traceparent: '00-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dddddddddddddddd-01',
+        },
+      },
+      () => {
+        runWithTraceContext('0af7651916cd43dd8448eb211c80319c', 'aaaaaaaaaaaaaaaa', () => {
+          pushActiveSpan('cccccccccccccccc');
+          const m = mergeEventContext();
+          expect(m?.trace).toEqual({
+            trace_id: '0af7651916cd43dd8448eb211c80319c',
+            span_id: 'cccccccccccccccc',
+            parent_span_id: 'aaaaaaaaaaaaaaaa',
+          });
+          expect(m?.http).toBeDefined();
+          expect((m?.correlation as Record<string, unknown> | undefined)?.traceId).toBe(
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          );
+        });
       },
     );
   });

@@ -15,6 +15,31 @@ export const W3C_SPAN_ID_RE = /^[0-9a-f]{16}$/u;
 export const w3cTraceId = z.string().regex(W3C_TRACE_ID_RE, 'trace_id must be 32 lowercase hex chars (W3C)');
 export const w3cSpanId = z.string().regex(W3C_SPAN_ID_RE, 'span_id must be 16 lowercase hex chars (W3C)');
 
+/**
+ * Ausência de trace, não "trace zero".
+ *
+ * A W3C Trace Context (§3.2.2.3) declara o trace-id all-zero INVÁLIDO, e é exatamente por isso que ele
+ * serve aqui: `trace` é obrigatório no v4, então o SDK precisava de algum valor quando não há contexto
+ * ativo — e até a 2.4.x esse valor era um id ALEATÓRIO. Um id aleatório é indistinguível de um id real:
+ * o evento entrava no banco parecendo correlacionado, apontando para um trace que nunca existiu.
+ *
+ * A sentinela troca isso por um valor que o servidor reconhece e traduz para `NULL` na coluna
+ * (`clickhouse-log-writer.ts` / `clickhouse-error-writer.ts`), tornando o órfão contável em vez de
+ * invisível.
+ */
+export const NULL_TRACE_ID = '00000000000000000000000000000000';
+export const NULL_SPAN_ID = '0000000000000000';
+
+/** `true` quando não há trace: sentinela, string vazia, `null` ou ausente. */
+export function isNullTraceId(value: string | null | undefined): boolean {
+  return value === undefined || value === null || value.trim() === '' || value === NULL_TRACE_ID;
+}
+
+/** `true` quando o evento não nasceu dentro de um span. Mesma regra de {@link isNullTraceId}. */
+export function isNullSpanId(value: string | null | undefined): boolean {
+  return value === undefined || value === null || value.trim() === '' || value === NULL_SPAN_ID;
+}
+
 /** v4 event kinds — `performance` from v3 is removed; timing belongs to spans. */
 export const EventTypeV4Schema = z.enum(['log', 'error']);
 

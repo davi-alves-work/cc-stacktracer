@@ -9,6 +9,7 @@ function randomUUID(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}-${Math.random().toString(36).slice(2, 11)}`;
 }
 import { parseTraceparentTraceId } from './traceparent.js';
+import { NULL_TRACE_ID } from './canonical-event-v4.schema.js';
 
 function asRecord(v: unknown): Record<string, unknown> | null {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
@@ -17,11 +18,23 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 
 /** Optional hints from the HTTP ingest request (correlation id, trace headers). */
 export type NormalizeOptions = {
-  /** Used when the payload omits trace identifiers (batch ingest, SDK batch). */
+  /**
+   * @deprecated No longer used to pick `trace_id` — it was a per-BATCH random id that stitched
+   * unrelated events into a common fake trace. `stacktrace-client.ts` still generates and passes
+   * it today; this field is now ignored here, and its generation is removed in a later task.
+   */
   requestTraceFallback?: string;
   /** W3C `traceparent` from the HTTP request when not in the body. */
   httpTraceparent?: string;
-  /** `x-request-id` from the HTTP request when not in the body. */
+  /**
+   * @deprecated Never was a trace id, and no SDK caller populates it — the branch that read it
+   * was unreachable in practice. Kept only so the type signature doesn't break for callers that
+   * pass the whole options object through.
+   *
+   * Not to be confused with the homonymous `NormalizeOptions` in `packages/shared/schema/normalize.ts`:
+   * the ingestion-api populates the field THERE (from the `x-request-id` header), and that file's
+   * strict v4 boundary also ignores it. Two distinct types with the same name.
+   */
   httpRequestId?: string;
   /** When set with {@link projectId}, SDK/HTTP can emit schema v2 events (organization + project UUIDs). */
   tenantId?: string;
@@ -97,6 +110,15 @@ function getHeaderCaseInsensitive(headers: Record<string, unknown>, name: string
   return undefined;
 }
 
+/**
+ * Fonte do `trace_id`, em ordem de autoridade. Sem nenhuma delas o evento NÃO ganha um id inventado:
+ * devolve {@link NULL_TRACE_ID}, que o servidor traduz para `NULL` na coluna.
+ *
+ * `x-request-id`/`x-correlation-id` saíram da lista de propósito (nunca foram trace id — e como quase
+ * nunca são 32-hex, o `eventV1ToV4` os descartava e sorteava um id no lugar), e o mesmo vale para o
+ * `requestTraceFallback`, que era um id aleatório POR LOTE: ele costurava eventos não relacionados
+ * num trace falso comum.
+ */
 function pickTraceId(meta: Record<string, unknown>, o: Record<string, unknown>, opts?: NormalizeOptions): string {
   const tr = asRecord(meta.trace);
   const corr = asRecord(meta.correlation);
@@ -109,28 +131,17 @@ function pickTraceId(meta: Record<string, unknown>, o: Record<string, unknown>, 
 
   const headers = asRecord(meta.headers);
   if (headers !== null) {
-    const tp = getHeaderCaseInsensitive(headers, 'traceparent');
-    const tid = parseTraceparentTraceId(tp);
-    if (tid !== undefined) return tid;
-    const xr =
-      getHeaderCaseInsensitive(headers, 'x-request-id') ?? getHeaderCaseInsensitive(headers, 'x-correlation-id');
-    if (xr !== undefined) return xr;
+    const fromBodyTraceparent = parseTraceparentTraceId(getHeaderCaseInsensitive(headers, 'traceparent'));
+    if (fromBodyTraceparent !== undefined) return fromBodyTraceparent;
   }
 
-  const tidOpt = parseTraceparentTraceId(opts?.httpTraceparent);
-  if (tidOpt !== undefined) return tidOpt;
-  if (typeof opts?.httpRequestId === 'string' && opts.httpRequestId.trim() !== '') {
-    return opts.httpRequestId.trim();
-  }
+  const fromOptsTraceparent = parseTraceparentTraceId(opts?.httpTraceparent);
+  if (fromOptsTraceparent !== undefined) return fromOptsTraceparent;
 
   const topLevel = typeof o.trace_id === 'string' && o.trace_id.trim() !== '' ? o.trace_id.trim() : undefined;
   if (topLevel !== undefined) return topLevel;
 
-  if (typeof opts?.requestTraceFallback === 'string' && opts.requestTraceFallback.trim() !== '') {
-    return opts.requestTraceFallback.trim();
-  }
-
-  return randomUUID();
+  return NULL_TRACE_ID;
 }
 
 function pickSpanIds(meta: Record<string, unknown>): { span_id?: string; parent_span_id?: string } {

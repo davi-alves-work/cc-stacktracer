@@ -20,6 +20,10 @@ export {
   w3cSpanId,
   W3C_TRACE_ID_RE,
   W3C_SPAN_ID_RE,
+  NULL_TRACE_ID,
+  NULL_SPAN_ID,
+  isNullTraceId,
+  isNullSpanId,
 } from './canonical-event-v4.schema.js';
 export type { EventV4 } from './canonical-event-v4.schema.js';
 export { HttpSchema } from './http.schema.js';

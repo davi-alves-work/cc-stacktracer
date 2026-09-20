@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import Fastify from 'fastify';
-import { createStackTraceClient } from '../index.js';
+import { createStackTraceClient, init, shutdown } from '../index.js';
 import type { BatchTransportPayload } from '../core/stacktrace-client.js';
+import type { StackTraceEvent } from '../core/stacktrace-event.types.js';
 import stacktracePlugin from './fastify.js';
 
 const serviceId = '11111111-1111-4111-8111-111111111111';
@@ -12,8 +13,16 @@ function sentPayloads(transport: ReturnType<typeof vi.fn>): BatchTransportPayloa
   return transport.mock.calls.map((call) => call[0] as BatchTransportPayload);
 }
 
+function sentEvents(transport: ReturnType<typeof vi.fn>): StackTraceEvent[] {
+  return sentPayloads(transport).flatMap((item) => (item.kind === 'batch' ? item.events : []));
+}
+
 describe('Fastify plugin', () => {
-  afterEach(async () => {});
+  afterEach(async () => {
+    // Some tests below drive `captureBoundaryError`'s default `captureException`, which reads the
+    // singleton set by `init()` — clear it so it never leaks into a later test in this file.
+    await shutdown();
+  });
 
   it('records one root HTTP span with status 200 and duration_us >= 0', async () => {
     const transport = vi.fn().mockResolvedValue(undefined);
@@ -160,6 +169,75 @@ describe('Fastify plugin', () => {
     const span = sentPayloads(transport).find((item) => item.kind === 'spans')?.spans[0];
     expect(span?.http_route).toBe('/callback');
     expect(span?.http_route).not.toContain('secret');
+
+    await app.close();
+  });
+
+  it('captureErrors: true emite um evento de erro correlacionado ao trace_id do span raiz', async () => {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    // `captureBoundaryError`'s default capture is `captureException`, which reads the singleton —
+    // not the `client` override used elsewhere in this file for span assertions — so this case
+    // goes through `init()` to exercise the real wiring end to end.
+    init({
+      apiKey: 'k',
+      serviceId,
+      service: 'svc',
+      environment: 'test',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+    });
+
+    const app = Fastify();
+    await app.register(stacktracePlugin, { captureErrors: true });
+    app.get('/boom', async () => {
+      throw new Error('boom');
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/boom' });
+    expect(res.statusCode).toBe(500);
+
+    await vi.waitFor(() => {
+      expect(sentPayloads(transport).some((item) => item.kind === 'spans')).toBe(true);
+      expect(sentPayloads(transport).some((item) => item.kind === 'batch')).toBe(true);
+    });
+
+    const span = sentPayloads(transport).find((item) => item.kind === 'spans')?.spans[0];
+    const errorEvent = sentEvents(transport).find((event) => event.type === 'error');
+    expect(errorEvent?.message).toBe('boom');
+    // Ancora a asserção seguinte num trace_id real — sem isso, dois `undefined` bateriam igual e
+    // mascarariam justamente a regressão de perda de contexto de trace que este teste existe para pegar.
+    expect(span?.trace_id).toMatch(/^[0-9a-f]{32}$/);
+    const trace = errorEvent?.context?.trace as { trace_id?: string } | undefined;
+    expect(trace?.trace_id).toBe(span?.trace_id);
+
+    await app.close();
+  });
+
+  it('sem captureErrors (opção ausente) nenhum evento de erro é enfileirado', async () => {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    init({
+      apiKey: 'k',
+      serviceId,
+      service: 'svc',
+      environment: 'test',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+    });
+
+    const app = Fastify();
+    await app.register(stacktracePlugin);
+    app.get('/boom', async () => {
+      throw new Error('boom');
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/boom' });
+    expect(res.statusCode).toBe(500);
+
+    await vi.waitFor(() => expect(sentPayloads(transport).some((item) => item.kind === 'spans')).toBe(true));
+
+    expect(sentPayloads(transport).some((item) => item.kind === 'batch')).toBe(false);
 
     await app.close();
   });

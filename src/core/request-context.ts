@@ -37,6 +37,30 @@ export function getRequestSnapshot(): HttpRequestSnapshot | undefined {
 }
 
 /**
+ * Bloco `trace` a partir do ALS de tracing — a fonte autoritativa de correlação.
+ *
+ * Fica FORA do ramo do snapshot HTTP de propósito. Até a 2.4.x ele vivia dentro dele, e a consequência
+ * era silenciosa: todo evento emitido por job, consumer, cron ou CLI — onde há trace mas não há
+ * requisição — saía sem correlação, e o normalizador inventava um `trace_id` para ele.
+ */
+function traceLayerFromSpanContext(): Record<string, unknown> | undefined {
+  const spanState = getTraceSpanState();
+  if (spanState === undefined) {
+    return undefined;
+  }
+  const stack = spanState.spanStack;
+  const trace: Record<string, unknown> = { trace_id: spanState.traceId };
+  if (stack.length > 0) {
+    // O topo da pilha é o span em execução — o evento pertence a ele.
+    trace.span_id = stack[stack.length - 1];
+  }
+  if (stack.length > 1) {
+    trace.parent_span_id = stack[stack.length - 2];
+  }
+  return trace;
+}
+
+/**
  * Merges AsyncLocalStorage business context, module scope (user/tags), HTTP ALS snapshot, then caller `context`.
  * Caller keys win last (explicit overrides ALS defaults).
  * Adds `headers` (for normalization trace resolution) and `trace` when `traceparent` is present,
@@ -52,6 +76,7 @@ export function mergeEventContext(explicit?: Record<string, unknown>): Record<st
   if (scope !== undefined) {
     layers.push(scope);
   }
+  const traceLayer = traceLayerFromSpanContext();
   const snap = getRequestSnapshot();
   if (snap !== undefined) {
     const corrFromHeaders = extractCorrelationFromHeaders(snap.headers);
@@ -69,36 +94,19 @@ export function mergeEventContext(explicit?: Record<string, unknown>): Record<st
         ...(corrFromHeaders.parentSpanId !== undefined ? { parentSpanId: corrFromHeaders.parentSpanId } : {}),
       };
     }
-
-    // The tracing ALS (trace-span-context) is the authoritative source for trace correlation
-    // when we are inside a Fastify request scope. It gives us the current active span_id so
-    // that log/error events are linked to the exact span they occurred in.
-    const spanState = getTraceSpanState();
-    if (spanState !== undefined) {
-      const stack = spanState.spanStack;
-      const traceBlock: Record<string, unknown> = { trace_id: spanState.traceId };
-      if (stack.length > 0) {
-        // The top of the stack is the currently executing span — this event belongs to it.
-        traceBlock.span_id = stack[stack.length - 1];
-      }
-      if (stack.length > 1) {
-        // Second-from-top is the parent of the current span.
-        traceBlock.parent_span_id = stack[stack.length - 2];
-      }
-      reqLayer.trace = traceBlock;
-    } else {
-      // Fall back to W3C traceparent / x-request-id from inbound headers when no local span
-      // context is active (e.g. events emitted outside of withSpan but still inside a request).
-      const corr = extractCorrelationFromHeaders(snap.headers);
-      if (corr.traceId !== undefined) {
-        reqLayer.trace = {
-          trace_id: corr.traceId,
-          ...(corr.parentSpanId !== undefined ? { parent_span_id: corr.parentSpanId } : {}),
-        };
-      }
+    if (traceLayer !== undefined) {
+      reqLayer.trace = traceLayer;
+    } else if (corrFromHeaders.traceId !== undefined) {
+      // Sem span local ativo (evento emitido dentro da requisição mas fora de qualquer `withSpan`):
+      // o `traceparent` de entrada ainda correlaciona com o chamador upstream.
+      reqLayer.trace = {
+        trace_id: corrFromHeaders.traceId,
+        ...(corrFromHeaders.parentSpanId !== undefined ? { parent_span_id: corrFromHeaders.parentSpanId } : {}),
+      };
     }
-
     layers.push(reqLayer);
+  } else if (traceLayer !== undefined) {
+    layers.push({ trace: traceLayer });
   }
   if (explicit !== undefined) {
     layers.push(explicit);

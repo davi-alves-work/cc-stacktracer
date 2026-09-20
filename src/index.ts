@@ -263,7 +263,7 @@ export type { CaptureContext } from './observability/capture/types.js';
 export { CaptureGate, CapturePolicyCache, RuleEngine } from './observability/capture/index.js';
 export { extractSqlVerb, measure, runQuery } from './performance/measure.js';
 export type { MeasureOptions, RunQueryOptions } from './performance/measure.js';
-export { withSpan, startSpan, endSpan, beginOutboundSpan, endOutboundSpan } from './core/tracing.js';
+export { withSpan, withTrace, startSpan, endSpan, beginOutboundSpan, endOutboundSpan } from './core/tracing.js';
 export type { SpanHandle, SpanOptions, OutboundSpanStart } from './core/tracing.js';
 export { instrumentFetch, instrumentNodeHttp } from './integrations/outbound-http/index.js';
 export type { OutboundHttpOptions, OutboundClassification } from './integrations/outbound-http/index.js';

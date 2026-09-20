@@ -12,8 +12,9 @@ import { headersToRecord } from '../utils/headers.js';
 import { redactUrl } from '../utils/redact-url.js';
 import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { httpRootSpanOutcome } from './http-root-span-outcome.js';
+import { captureBoundaryError, type BoundaryCaptureOptions } from './capture-boundary-error.js';
 
-export type StacktracePluginOptions = {
+export type StacktracePluginOptions = BoundaryCaptureOptions & {
   /** Override for tests; defaults to singleton from init(). */
   client?: StackTraceClient | null;
 };
@@ -139,11 +140,13 @@ async function stacktracePluginImpl(
     });
   });
 
-  fastify.addHook('onError', (_request, reply, _error, done) => {
+  fastify.addHook('onError', (_request, reply, error, done) => {
     const snap = getRequestSnapshot();
     if (snap !== undefined) {
       snap.statusCode = reply.statusCode;
     }
+    // Depois de fixar o status: o evento carrega o `response_status_code` da resposta que falhou.
+    captureBoundaryError(error, opts);
     done();
   });
 

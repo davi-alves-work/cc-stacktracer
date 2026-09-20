@@ -9,8 +9,9 @@ import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { redactHeaders } from '../utils/redact-headers.js';
 import { redactUrl } from '../utils/redact-url.js';
 import { httpRootSpanOutcome } from './http-root-span-outcome.js';
+import { captureBoundaryError, type BoundaryCaptureOptions } from './capture-boundary-error.js';
 
-export type StacktraceAdonisOptions = {
+export type StacktraceAdonisOptions = BoundaryCaptureOptions & {
   /** Override for tests; defaults to singleton from init(). */
   client?: StackTraceClient | null;
   /**
@@ -128,7 +129,12 @@ export function stacktraceAdonisMiddleware(
             raw.on('finish', () => emit(false));
             raw.on('close', () => emit(true));
           }
-          await next();
+          try {
+            await next();
+          } catch (err) {
+            captureBoundaryError(err, opts);
+            throw err;
+          }
           if (typeof raw.on !== 'function') {
             emit(false);
           }

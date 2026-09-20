@@ -1,17 +1,19 @@
 import type { z } from 'zod';
 import { BusinessSchema } from '../schema/business.schema.js';
 import { DbSchema } from '../schema/db.schema.js';
-import { EventSchemaV4, type EventV4, W3C_SPAN_ID_RE, W3C_TRACE_ID_RE } from '../schema/canonical-event-v4.schema.js';
+import {
+  EventSchemaV4,
+  type EventV4,
+  NULL_SPAN_ID,
+  NULL_TRACE_ID,
+  W3C_SPAN_ID_RE,
+  W3C_TRACE_ID_RE,
+} from '../schema/canonical-event-v4.schema.js';
 import type { CanonicalInput } from '../schema/event.schema.js';
 import { HttpSchema } from '../schema/http.schema.js';
 import { MetadataSchema } from '../schema/metadata.schema.js';
 import { maskDynamicRouteSegments, routeHasRawDynamicSegments } from '../schema/route-validation.js';
 import { coerceToCanonicalInput, type NormalizeOptions } from '../schema/normalize.js';
-
-/** UUID v4 hex without dashes for span_id fallback (16 chars). */
-function generateSpanId(): string {
-  return Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-}
 
 /**
  * Prefer a normalized route template when the concrete route still has raw ids (numeric/UUID segments).
@@ -143,11 +145,6 @@ function v1MetadataToCorrelation(
   return p.success ? p.data : undefined;
 }
 
-/** Lowercase hex string of `chars` length, generated without `node:crypto` (browser-safe). */
-function randomHex(chars: number): string {
-  return Array.from({ length: chars }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-}
-
 /**
  * Identidade do usuário final. Até a 2.1.x isto caía no ramo `typeof v === 'object'` abaixo e era
  * DESCARTADO via `onDroppedContextKey` — `setUser()` não chegava a lugar nenhum.
@@ -266,8 +263,10 @@ function structureMetadataFromV1Event(
  * Maps a normalized v1 {@link Event} to strict **v4** {@link EventV4}.
  *
  * - `request`/`performance` → `log` (timing belongs to spans; v4 has no such types).
- * - trace/span ids are coerced to W3C hex (regenerated only when the source id is not already valid hex,
- *   so an inbound `traceparent` is preserved); a missing `span_id` gets a fresh 16-hex id.
+ * - trace/span ids are never invented: an id already in valid W3C hex is passed through unchanged
+ *   (so an inbound `traceparent` is preserved); anything else — missing, malformed, or a trace-less
+ *   span — becomes {@link NULL_TRACE_ID}/{@link NULL_SPAN_ID}. A random id would be indistinguishable
+ *   from a real one and would point at a trace that never existed.
  */
 export function eventV1ToV4(
   event: CanonicalInput,
@@ -291,12 +290,16 @@ export function eventV1ToV4(
         }
       : undefined;
 
-  const rawSpan =
-    event.trace.span_id !== undefined && event.trace.span_id.trim() !== '' ? event.trace.span_id : generateSpanId();
-  const trace_id = W3C_TRACE_ID_RE.test(event.trace.trace_id) ? event.trace.trace_id : randomHex(32);
-  const span_id = W3C_SPAN_ID_RE.test(rawSpan) ? rawSpan : randomHex(16);
+  // Nada aqui regenera id. Um id inválido significa "não havia trace/span", e a sentinela diz isso —
+  // um id aleatório diria "havia", apontando para um trace que nunca existiu. Ver NULL_TRACE_ID.
+  const trace_id = W3C_TRACE_ID_RE.test(event.trace.trace_id) ? event.trace.trace_id : NULL_TRACE_ID;
+  const hasTrace = trace_id !== NULL_TRACE_ID; // um span não sobrevive sem o trace ao qual pertence
+  const rawSpan = event.trace.span_id ?? '';
+  const span_id = hasTrace && W3C_SPAN_ID_RE.test(rawSpan) ? rawSpan : NULL_SPAN_ID;
   const parent =
-    typeof event.trace.parent_span_id === 'string' && W3C_SPAN_ID_RE.test(event.trace.parent_span_id)
+    typeof event.trace.parent_span_id === 'string' &&
+    W3C_SPAN_ID_RE.test(event.trace.parent_span_id) &&
+    event.trace.parent_span_id !== NULL_SPAN_ID
       ? event.trace.parent_span_id
       : undefined;
   const trace: EventV4['trace'] = { trace_id, span_id, ...(parent !== undefined ? { parent_span_id: parent } : {}) };

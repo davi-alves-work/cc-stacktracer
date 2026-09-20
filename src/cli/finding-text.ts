@@ -29,6 +29,8 @@ const FINDING_TEXT: Record<InstrumentationCheck, (p: FindingParams) => string> =
     `routes carrying raw ids (e.g. "${p.example}") across ${p.distinctRoutes} distinct routes — high cardinality; use a :id template.`,
   subtenant_cardinality: (p) =>
     `${p.distinctSubtenants} distinct subtenants — check whether the payload's \`subtenant\` field is receiving a user or request id.`,
+  events_untraced: (p) =>
+    `${p.untracedPct}% of events (${p.untracedEvents} of ${p.totalEvents}) arrived without a trace_id — they do not show up in the trace they belong to. Emit logs inside the request handler, not after the response.`,
   ok: () => 'no instrumentation gaps detected.',
 };
 

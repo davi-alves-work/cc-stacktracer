@@ -1,4 +1,13 @@
 /**
+ * Mesmos valores que `NULL_TRACE_ID`/`NULL_SPAN_ID` (`canonical-event-v4.schema.ts`), duplicados de
+ * propósito: importar de lá arrastaria zod e o grafo de schemas para dentro de um parser de string.
+ * A W3C manda rejeitar esses valores (§3.2.2.3); lá o mesmo valor é emitido para dizer "sem trace" —
+ * coincidem por construção, não por acidente.
+ */
+const ALL_ZERO_TRACE_ID = '00000000000000000000000000000000';
+const ALL_ZERO_SPAN_ID = '0000000000000000';
+
+/**
  * Parses W3C `traceparent` (`version-trace_id-parent_id-trace_flags`).
  * The third segment is the W3C **parent-id** (parent span id in the distributed trace).
  * @see https://www.w3.org/TR/trace-context/
@@ -35,6 +44,11 @@ export function parseTraceparent(value: string | undefined): ParsedTraceparent |
   const tid = traceId.toLowerCase();
   const pid = parentId.toLowerCase();
   const fl = flags.toLowerCase();
+  // All-zero é inválido pela W3C §3.2.2.3, e aceitar abriria um contexto de trace que o resto do SDK
+  // leria como "sem trace" (ver NULL_TRACE_ID).
+  if (tid === ALL_ZERO_TRACE_ID || pid === ALL_ZERO_SPAN_ID) {
+    return undefined;
+  }
   return {
     traceId: tid,
     parentSpanId: pid,

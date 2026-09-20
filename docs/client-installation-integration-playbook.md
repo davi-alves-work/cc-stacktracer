@@ -348,6 +348,64 @@ await StackTrace.withSpan({ type: 'service', name: 'billing.charge' }, async () 
 - Trace timeline is readable and linked (not fragmented).
 - Child spans can be traced back to the request origin.
 
+### Correlating events with traces
+
+A log or error only inherits `trace_id`/`span_id` when it is emitted **while the request's trace
+context is still active**. That context lives in `AsyncLocalStorage` and closes when the request
+ends — code that runs after that point is invisible to it, not misattributed to the wrong trace.
+
+**Rule:** emit inside the handler, before the response is sent.
+
+**Anti-pattern (reject in review):** any log/error emitted after the response has gone out —
+a `res.on('finish')` handler, a `setTimeout`/`setImmediate` scheduled from the route, or a
+fire-and-forget promise that resolves after `reply.send()`. Each of these runs outside the trace
+context; the event does not end up correlated to the wrong trace, it ends up with no trace at all.
+
+```ts
+// WRONG — runs after the response already closed the trace context.
+app.get('/orders/:id', async (req, reply) => {
+  const order = await loadOrder(req.params.id);
+  reply.send(order);
+  reply.raw.on('finish', () => {
+    StackTrace.log('order served', { orderId: order.id });
+  });
+});
+```
+
+```ts
+// RIGHT — the log is emitted inside the handler, while the request's trace is still active.
+app.get('/orders/:id', async (req, reply) => {
+  const order = await loadOrder(req.params.id);
+  StackTrace.log('order served', { orderId: order.id });
+  reply.send(order);
+});
+```
+
+**Outside HTTP (job, consumer, cron, CLI):** there is no ambient trace by default, and without one
+`withSpan` is a silent no-op. Use `withTrace` to open one for the entry point:
+
+```ts
+import { withTrace } from 'cc-stacktracer';
+
+await withTrace('job.reconcile-invoices', async () => {
+  await reconcileInvoices();
+  // spans and logs in here inherit this trace.
+});
+```
+
+`withTrace` called from inside an already-active trace (e.g. a job triggered from within a
+request) delegates to `withSpan` and becomes a child span instead of opening a second trace.
+
+**`captureErrors` as an alternative to the manual error handler:** the Fastify and Adonis plugins
+accept `captureErrors: true` to capture the error that reaches the framework's error boundary
+automatically, already inside the request's trace context (Express has no such hook on the main
+middleware chain — register `stacktraceErrorMiddleware({ captureErrors: true })` after the routes
+instead). Default is `false` in all three: turning it on in an app whose own error handler already
+calls `captureException` would double-count every occurrence.
+
+Full guide, including why the `events_untraced` check only becomes accurate as clients upgrade:
+[`docs/guides/correlate-logs-traces.md`](./guides/correlate-logs-traces.md).
+
 ## 10) Phase 8 - Global error handler with enriched payloads
 
 Capture technical exceptions with safe metadata:

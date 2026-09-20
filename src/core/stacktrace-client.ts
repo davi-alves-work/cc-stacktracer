@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
 import { normalizeEventV4, type NormalizeOptions } from '../shared/schema/index.js';
 import type { ParsedStackTraceInit } from './config.schema.js';
@@ -319,17 +318,16 @@ export class StackTraceClient {
     const url = `${base}${DEFAULT_INGEST_PATH}`;
     const signPath = ingestPathForSignature(url, DEFAULT_INGEST_PATH);
     const wire = batch.map((e) => toWirePayloadForIngest(e));
-    // W3C-hex (32) trace fallback so v4 events without an inbound traceparent still validate.
-    const batchTraceFallback = randomBytes(16).toString('hex');
+    // Sem fallback de trace por lote: evento sem contexto sai com NULL_TRACE_ID, e o servidor o grava
+    // como NULL. O fallback aleatório anterior dava a TODOS os eventos do lote o mesmo trace_id falso.
     const normalizeOpts: NormalizeOptions =
       this.config.tenantId !== undefined && this.config.projectId !== undefined
         ? {
-            requestTraceFallback: batchTraceFallback,
             tenantId: this.config.tenantId,
             projectId: this.config.projectId,
             serviceId: this.config.serviceId,
           }
-        : { requestTraceFallback: batchTraceFallback, serviceId: this.config.serviceId };
+        : { serviceId: this.config.serviceId };
     if (this.config.logger?.warn !== undefined) {
       normalizeOpts.onDroppedContextKey = (key: string) => this.warnDroppedContextKey(key);
     }
