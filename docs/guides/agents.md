@@ -119,3 +119,36 @@ human reading the terminal.
 
 Do not replicate the audit rules in application code: they live on the server, and a second copy
 would start disagreeing with the dashboard.
+
+## 9. Fail-open: what the SDK guarantees
+
+The SDK is built so that telemetry can never take your application down:
+
+- A failure inside the SDK is swallowed and that piece of telemetry is dropped. Your request, query or
+  `fetch` returns exactly what it would without the SDK, runs exactly once, and your errors reach you
+  as the same object.
+- `init()` never throws. An invalid configuration prints one `console.error` (field paths and messages,
+  never values) and leaves the SDK off. Run `npx cc-stacktracer doctor` in CI if you want a failing build.
+- Internal failures are silent by default. Pass `logger` (or `debug: true`) to see them.
+- After 100 internal failures within 60 seconds the SDK disables itself until the process restarts, and
+  says so once on `console.warn`.
+- In-memory queues are bounded: 1,000 events and 10,000 spans by default (`maxQueueSize` overrides both).
+- `flush()` and `shutdown()` never reject and return within 5 seconds.
+- A throwing `beforeSend` drops the event: it is usually your PII redaction, so nothing leaves unredacted.
+
+### Kill switch
+
+Set `STACKTRACE_DISABLED=1` (also `true`, `yes`, `on`) and restart. `init()`/`auto()` return before
+reading the configuration, `fetch` and `node:http` are not patched, and every middleware becomes a plain
+pass-through.
+
+`enabled: false` is different: it only stops sending — the hooks stay installed and keep running. Use the
+kill switch when you suspect the SDK itself; use `enabled: false` to silence an environment.
+
+### `enableGlobalHandlers`
+
+The SDK never removes your `uncaughtException` / `unhandledRejection` listeners. If you registered your
+own, the process fate is yours: the SDK captures and flushes in the background but does not exit — to
+guarantee the crash event is delivered, `await StackTrace.flush()` in your handler before exiting. If the
+SDK is the only listener, it reproduces Node's default: capture, flush (up to 2 s), print the error, exit
+with code 1 — honouring `--unhandled-rejections`.

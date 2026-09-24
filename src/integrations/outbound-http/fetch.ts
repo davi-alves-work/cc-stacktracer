@@ -1,4 +1,5 @@
-import { beginOutboundSpan, endOutboundSpan } from '../../core/tracing.js';
+import { isTelemetryActive, safeRun } from '../../core/safe-run.js';
+import { beginOutboundSpan, endOutboundSpan, type OutboundSpanStart } from '../../core/tracing.js';
 import { buildTraceparent } from '../../utils/traceparent.js';
 import { classifyOutboundUrl, sanitizedTarget } from './url-classification.js';
 import type { OutboundHttpOptions } from './types.js';
@@ -31,17 +32,54 @@ function resolveMethod(input: FetchInput, init: FetchInit): string {
   return 'GET';
 }
 
-/** Returns a new `init` with `traceparent` set, merging Request headers (when input is a Request) + init headers. */
+/**
+ * `fetch(request, { headers })` SUBSTITUI os headers do Request (spec Fetch) — não mescla. Então
+ * `init.headers` vale sozinho quando existe; só na falta dele herdamos os do Request.
+ */
 function withTraceparent(input: FetchInput, init: FetchInit, traceparent: string): FetchInit {
-  const merged = new Headers();
-  if (isRequest(input)) {
-    input.headers.forEach((value, key) => merged.set(key, value));
-  }
-  if (init?.headers !== undefined) {
-    new Headers(init.headers).forEach((value, key) => merged.set(key, value));
-  }
-  merged.set('traceparent', traceparent);
-  return { ...(init ?? {}), headers: merged };
+  const headers = new Headers(init?.headers ?? (isRequest(input) ? input.headers : undefined));
+  headers.set('traceparent', traceparent);
+  return { ...(init ?? {}), headers };
+}
+
+type PreparedFetch = {
+  begin: OutboundSpanStart;
+  init: FetchInit;
+  name: string;
+  attributes: Record<string, unknown>;
+};
+
+/** Tudo o que o SDK faz ANTES da chamada. `undefined` = esta chamada não é instrumentada. */
+function prepareFetch(
+  input: FetchInput,
+  init: FetchInit,
+  options: OutboundHttpOptions,
+  propagate: boolean,
+): PreparedFetch | undefined {
+  const url = resolveUrl(input);
+  if (url === undefined) return undefined;
+  const begin = beginOutboundSpan();
+  if (begin === null) return undefined;
+  const classification = classifyOutboundUrl(url, options);
+  if (classification.kind === 'ignored') return undefined;
+  const method = resolveMethod(input, init).toUpperCase();
+  return {
+    begin,
+    init: propagate
+      ? withTraceparent(input, init, buildTraceparent(begin.traceId, begin.spanId, begin.traceFlags))
+      : init,
+    name: `http.client ${method} ${url.host}`,
+    attributes: {
+      http_method: method,
+      http_route: sanitizedTarget(url),
+      'url.scheme': url.protocol.replace(':', ''),
+      'server.address': url.hostname,
+      ...(url.port !== '' ? { 'server.port': Number(url.port) } : {}),
+      'peer.kind': classification.kind === 'internal_service' ? 'internal_service' : 'external_api',
+      ...(classification.kind === 'internal_service' ? { 'peer.service': classification.serviceName } : {}),
+      trace_flags: begin.traceFlags,
+    },
+  };
 }
 
 /**
@@ -50,11 +88,15 @@ function withTraceparent(input: FetchInput, init: FetchInit, traceparent: string
  *
  * - No active trace context ⇒ pass through untouched (no span).
  * - Ignored URLs (ingestion endpoint, `ignoreUrls`, non-`allowUrls`) ⇒ pass through untouched.
+ * - SDK setup failure ⇒ pass through untouched. The real `fetch` is called exactly once, always.
  * - Headers are not captured by default (only `traceparent` is injected).
  *
  * Returns an uninstrument function. Idempotent: a second call while already instrumented is a no-op.
  */
 export function instrumentFetch(options: OutboundHttpOptions = {}): () => void {
+  if (!isTelemetryActive()) {
+    return () => {};
+  }
   const globalRef = globalThis as typeof globalThis & { fetch?: FetchFn };
   const current = globalRef.fetch;
   if (typeof current !== 'function') {
@@ -67,49 +109,37 @@ export function instrumentFetch(options: OutboundHttpOptions = {}): () => void {
   const propagate = options.propagateTraceparent !== false;
 
   const wrapped = async function instrumentedFetch(input: FetchInput, init?: FetchInit): Promise<Response> {
-    const url = resolveUrl(input);
-    const begin = url !== undefined ? beginOutboundSpan() : null;
-    if (url === undefined || begin === null) {
+    const prepared = isTelemetryActive()
+      ? safeRun('fetch.setup', () => prepareFetch(input, init, options, propagate))
+      : undefined;
+    if (prepared === undefined) {
       return original(input, init);
     }
-    const classification = classifyOutboundUrl(url, options);
-    if (classification.kind === 'ignored') {
-      return original(input, init);
-    }
-
-    const method = resolveMethod(input, init).toUpperCase();
-    const nextInit = propagate
-      ? withTraceparent(input, init, buildTraceparent(begin.traceId, begin.spanId, begin.traceFlags))
-      : init;
-
-    const attributes: Record<string, unknown> = {
-      http_method: method,
-      http_route: sanitizedTarget(url),
-      'url.scheme': url.protocol.replace(':', ''),
-      'server.address': url.hostname,
-      ...(url.port !== '' ? { 'server.port': Number(url.port) } : {}),
-      'peer.kind': classification.kind === 'internal_service' ? 'internal_service' : 'external_api',
-      ...(classification.kind === 'internal_service' ? { 'peer.service': classification.serviceName } : {}),
-      trace_flags: begin.traceFlags,
-    };
-    const name = `http.client ${method} ${url.host}`;
-
+    let response: Response;
     try {
-      const response = await original(input, nextInit);
-      const errored = response.status >= 500;
-      const err = errored ? Object.assign(new Error(`HTTP ${response.status}`), { name: 'HttpError' }) : undefined;
-      endOutboundSpan(begin, {
-        name,
-        type: 'external',
-        attributes: { ...attributes, http_status_code: response.status },
-        ...(err !== undefined ? { err } : {}),
-      });
-      return response;
+      response = await original(input, prepared.init);
     } catch (rawErr) {
-      const err = rawErr instanceof Error ? rawErr : new Error(String(rawErr));
-      endOutboundSpan(begin, { name, type: 'external', attributes, err });
+      safeRun('fetch.end', () =>
+        endOutboundSpan(prepared.begin, {
+          name: prepared.name,
+          type: 'external',
+          attributes: prepared.attributes,
+          err: rawErr instanceof Error ? rawErr : new Error(String(rawErr)),
+        }),
+      );
       throw rawErr;
     }
+    safeRun('fetch.end', () => {
+      const err =
+        response.status >= 500 ? Object.assign(new Error(`HTTP ${response.status}`), { name: 'HttpError' }) : undefined;
+      endOutboundSpan(prepared.begin, {
+        name: prepared.name,
+        type: 'external',
+        attributes: { ...prepared.attributes, http_status_code: response.status },
+        ...(err !== undefined ? { err } : {}),
+      });
+    });
+    return response;
   } as FetchFn;
 
   (wrapped as { [FETCH_INSTRUMENTED]?: boolean })[FETCH_INSTRUMENTED] = true;

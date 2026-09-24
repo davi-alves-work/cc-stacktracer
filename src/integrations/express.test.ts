@@ -1,11 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import express from 'express';
 import request from 'supertest';
 import { createStackTraceClient } from '../index.js';
 import type { BatchTransportPayload } from '../core/stacktrace-client.js';
-import { stacktraceExpressMiddleware } from './express.js';
+import { resetFailOpenState } from '../core/safe-run.js';
+import type { StackTraceClient } from '../core/stacktrace-client.js';
+import { stacktraceErrorMiddleware, stacktraceExpressMiddleware } from './express.js';
 
 const serviceId = '11111111-1111-4111-8111-111111111111';
 
@@ -140,5 +142,82 @@ describe('Express middleware', () => {
     const span = sentPayloads(transport).find((item) => item.kind === 'spans')?.spans[0];
     expect(span?.http_route).toBe('/callback');
     expect(span?.http_route).not.toContain('secret');
+  });
+});
+
+describe('Express middleware fail-open', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    resetFailOpenState();
+  });
+
+  function failOpenClient(transport = vi.fn().mockResolvedValue(undefined)): StackTraceClient {
+    return createStackTraceClient({
+      apiKey: 'k',
+      serviceId,
+      service: 'svc',
+      environment: 'test',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+    });
+  }
+
+  function appWith(client: StackTraceClient): express.Express {
+    const app = express();
+    app.use(stacktraceExpressMiddleware({ client }));
+    app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
+    return app;
+  }
+
+  it('atende a requisição normalmente quando o setup da telemetria lança', async () => {
+    const client = failOpenClient();
+    vi.spyOn(client, 'getHeaderRedactionOptions').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    const res = await request(appWith(client)).get('/health');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+  });
+
+  it('um throw ao emitir o span raiz não escapa do listener de finish', async () => {
+    const client = failOpenClient();
+    const enqueueSpan = vi.spyOn(client, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    const res = await request(appWith(client)).get('/health');
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(enqueueSpan).toHaveBeenCalled());
+  });
+
+  it('com STACKTRACE_DISABLED o middleware é um pass-through puro', async () => {
+    vi.stubEnv('STACKTRACE_DISABLED', '1');
+    resetFailOpenState();
+    const transport = vi.fn().mockResolvedValue(undefined);
+    const res = await request(appWith(failOpenClient(transport))).get('/health');
+    expect(res.status).toBe(200);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  it('o error middleware repassa o erro ORIGINAL mesmo quando a captura lança', async () => {
+    const weird = {
+      toString(): string {
+        throw new Error('boom');
+      },
+    };
+    let received: unknown;
+    const app = express();
+    app.get('/x', () => {
+      throw weird;
+    });
+    app.use(stacktraceErrorMiddleware({ captureErrors: true }));
+    app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      received = err;
+      res.status(500).end();
+    });
+    await request(app).get('/x');
+    expect(received).toBe(weird);
   });
 });

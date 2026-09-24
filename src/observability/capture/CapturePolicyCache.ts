@@ -6,6 +6,7 @@ import {
   type CompiledCapturePolicy,
 } from '../../shared/schema/index.js';
 import { buildCapturePolicyServiceIdKey } from './policy-key.js';
+import { reportInternalFailure, runDetached } from '../../core/safe-run.js';
 
 export type CapturePolicyCacheOptions = {
   apiKey: string;
@@ -70,7 +71,7 @@ export class CapturePolicyCache {
       return;
     }
     this.stopped = false;
-    void this.fetchOnce();
+    runDetached('capturePolicy.fetch', () => this.fetchOnce());
   }
 
   stop(): void {
@@ -88,7 +89,7 @@ export class CapturePolicyCache {
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = null;
-      void this.fetchOnce();
+      runDetached('capturePolicy.fetch', () => this.fetchOnce());
     }, delayMs);
     this.timer.unref?.();
   }
@@ -128,16 +129,18 @@ export class CapturePolicyCache {
     }
     this.inFlight = true;
     let nextDelayMs: number | undefined;
-    const url = this.opts.capturePolicyUrl ?? buildDefaultUrl(this.opts.endpoint, this.opts.serviceId);
-    const headers: Record<string, string> = {
-      'x-api-key': this.opts.apiKey,
-      ...(this.opts.getHeaders?.() ?? {}),
-    };
     try {
+      // `getHeaders` é código do cliente: se lançar, é uma falha de fetch como outra qualquer (backoff),
+      // e o `finally` devolve `inFlight` a false.
+      const url = this.opts.capturePolicyUrl ?? buildDefaultUrl(this.opts.endpoint, this.opts.serviceId);
+      const headers: Record<string, string> = {
+        'x-api-key': this.opts.apiKey,
+        ...(this.opts.getHeaders?.() ?? {}),
+      };
       const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
       const res = await fetch(url, { method: 'GET', headers, signal });
       if (!res.ok) {
-        this.opts.onFetchError?.(new Error(`capture-policy HTTP ${res.status}`));
+        this.notifyFetchError(new Error(`capture-policy HTTP ${res.status}`));
         nextDelayMs = res.status === 429 ? (this.retryAfterDelay(res) ?? this.backoffDelay()) : this.backoffDelay();
         return;
       }
@@ -160,13 +163,21 @@ export class CapturePolicyCache {
       this.failureCount = 0;
       nextDelayMs = this.jitter(this.opts.refreshMs);
     } catch (err) {
-      this.opts.onFetchError?.(err);
+      this.notifyFetchError(err);
       nextDelayMs = this.backoffDelay();
     } finally {
       this.inFlight = false;
       if (nextDelayMs !== undefined) {
         this.scheduleNext(nextDelayMs);
       }
+    }
+  }
+
+  private notifyFetchError(err: unknown): void {
+    try {
+      this.opts.onFetchError?.(err);
+    } catch (callbackErr) {
+      reportInternalFailure('capturePolicy.onFetchError', callbackErr);
     }
   }
 
@@ -186,6 +197,12 @@ export class CapturePolicyCache {
       const one = capturePolicyNoticeSchema.safeParse(item);
       if (one.success) parsed.push(one.data);
     }
-    if (parsed.length > 0) this.opts.onNotices(parsed);
+    if (parsed.length > 0) {
+      try {
+        this.opts.onNotices(parsed);
+      } catch (err) {
+        reportInternalFailure('capturePolicy.onNotices', err);
+      }
+    }
   }
 }

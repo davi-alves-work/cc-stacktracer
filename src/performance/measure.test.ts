@@ -5,6 +5,7 @@ import { parseStackTraceInit } from '../core/config.schema.js';
 import { StackTraceClient } from '../core/stacktrace-client.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
 import { extractSqlVerb, measure, runQuery } from './measure.js';
+import { getStackTraceClient, init, shutdown } from '../index.js';
 
 describe('extractSqlVerb', () => {
   it('parses common SQL verbs', () => {
@@ -157,5 +158,61 @@ describe('measure attributes option', () => {
 
     await client.shutdown();
     setSdkRuntime(null, null);
+  });
+});
+
+describe('measure / runQuery fail-open', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await shutdown();
+  });
+
+  function initWithThrowingTelemetry(): void {
+    init({
+      apiKey: 'k',
+      serviceId: '11111111-1111-4111-8111-111111111111',
+      service: 'svc',
+      environment: 'prod',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport: vi.fn().mockResolvedValue(undefined),
+    });
+    const client = getStackTraceClient()!;
+    vi.spyOn(client, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    vi.spyOn(client, 'enqueue').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+  }
+
+  it('measure devolve o resultado de fn mesmo se emitir o span lançar', async () => {
+    initWithThrowingTelemetry();
+    const fn = vi.fn(async () => 'ok');
+    await runWithTraceContext('trace-m-fo-1', randomUUID(), async () => {
+      await expect(measure('billing.charge', fn)).resolves.toBe('ok');
+    });
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('measure relança o erro original pela identidade mesmo se capturar o erro lançar', async () => {
+    initWithThrowingTelemetry();
+    const appError = new Error('declined');
+    await runWithTraceContext('trace-m-fo-2', randomUUID(), async () => {
+      await expect(
+        measure('billing.charge', () => {
+          throw appError;
+        }),
+      ).rejects.toBe(appError);
+    });
+  });
+
+  it('runQuery (aninhado) devolve o resultado mesmo se emitir o span lançar', async () => {
+    initWithThrowingTelemetry();
+    const fn = vi.fn(async () => 1);
+    await runWithTraceContext('trace-m-fo-3', randomUUID(), async () => {
+      await expect(runQuery('postgres', 'orders.insert', fn)).resolves.toBe(1);
+    });
+    expect(fn).toHaveBeenCalledTimes(1);
   });
 });

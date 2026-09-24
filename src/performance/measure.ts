@@ -1,6 +1,7 @@
 import { buildErrorEvent } from '../capture/build-error-event.js';
 import { getSdkRuntime } from '../core/client-ref.js';
-import { beginOutboundSpan, endOutboundSpan, withSpan } from '../core/tracing.js';
+import { isTelemetryActive, safeRun } from '../core/safe-run.js';
+import { beginOutboundSpan, endOutboundSpan, withSpan, type SpanOptions } from '../core/tracing.js';
 import { extractSqlVerb } from './sql-verb.js';
 
 export { extractSqlVerb } from './sql-verb.js';
@@ -52,78 +53,130 @@ function kindToSpanType(kind: MeasureKind): 'db' | 'http' | 'external' | 'busine
   return 'business';
 }
 
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function measureSpanOptions(operation: string, options: MeasureOptions | undefined): SpanOptions {
+  const kind = options?.kind ?? 'internal';
+  const attributes: Record<string, unknown> = {};
+  if (kind === 'db') {
+    const sqlVerb = options?.dbSqlVerb ?? extractSqlVerb(options?.dbSql);
+    attributes.db_system = options?.dbSystem ?? 'unknown';
+    attributes.db_operation = sqlVerb ?? operation;
+    if (options?.dbTable !== undefined) attributes.db_table = options.dbTable;
+  }
+  if (kind === 'http') {
+    attributes.http_route = operation;
+  }
+  if (kind === 'queue') {
+    attributes.metadata_hint = operation;
+  }
+  if (options?.attributes !== undefined) {
+    Object.assign(attributes, options.attributes);
+  }
+  return { type: kindToSpanType(kind), attributes };
+}
+
+function captureMeasureError(
+  operation: string,
+  options: MeasureOptions | undefined,
+  start: number,
+  err: unknown,
+): void {
+  const { client, initConfig } = getSdkRuntime();
+  if (!client || !initConfig) return;
+  const duration_ms = Math.round(performance.now() - start);
+  const kind = options?.kind ?? 'internal';
+  const perf = kind === 'db' ? {} : { performance: { operation, duration_ms, failed: true, kind } };
+  const dbCtx =
+    kind === 'db'
+      ? {
+          db: {
+            system: options?.dbSystem ?? 'unknown',
+            operation: options?.dbSqlVerb ?? extractSqlVerb(options?.dbSql) ?? operation,
+            ...(options?.dbTable !== undefined ? { table: options.dbTable } : {}),
+            duration_ms,
+          },
+        }
+      : {};
+  client.enqueue(
+    buildErrorEvent({
+      service: initConfig.service,
+      environment: initConfig.environment,
+      error: asError(err),
+      context: { ...dbCtx, ...perf },
+    }),
+  );
+}
+
 /**
  * Runs `fn`, records duration as a **span** (no success log). On failure, captures an error event and rethrows.
  */
 export async function measure<T>(operation: string, fn: () => Promise<T> | T, options?: MeasureOptions): Promise<T> {
-  const kind = options?.kind ?? 'internal';
-  const spanType = kindToSpanType(kind);
-  const { client, initConfig } = getSdkRuntime();
   const start = performance.now();
+  const spanOptions =
+    options?.silent === true || !isTelemetryActive()
+      ? undefined
+      : safeRun('measure.setup', () => measureSpanOptions(operation, options));
+  let out: Awaited<T>;
   try {
-    const run = async (): Promise<T> => {
-      const result = await Promise.resolve(fn());
-      return result;
-    };
-
-    if (options?.silent) {
-      return await run();
-    }
-
-    const attrs: Record<string, unknown> = {};
-    if (kind === 'db') {
-      const sqlVerb = options?.dbSqlVerb ?? extractSqlVerb(options?.dbSql);
-      attrs.db_system = options?.dbSystem ?? 'unknown';
-      attrs.db_operation = sqlVerb ?? operation;
-      if (options?.dbTable !== undefined) attrs.db_table = options.dbTable;
-    }
-    if (kind === 'http') {
-      attrs.http_route = operation;
-    }
-    if (kind === 'queue') {
-      attrs.metadata_hint = operation;
-    }
-    if (options?.attributes !== undefined) {
-      Object.assign(attrs, options.attributes);
-    }
-
-    return await withSpan(operation, run, { type: spanType, attributes: attrs });
+    out = spanOptions === undefined ? await fn() : await withSpan(operation, fn, spanOptions);
   } catch (err) {
-    const duration_ms = Math.round(performance.now() - start);
-    const error = err instanceof Error ? err : new Error(String(err));
-    if (client && initConfig) {
-      const kindInner = options?.kind ?? 'internal';
-      const perf = kindInner === 'db' ? {} : { performance: { operation, duration_ms, failed: true, kind: kindInner } };
-      const dbCtx =
-        kindInner === 'db'
-          ? {
-              db: {
-                system: options?.dbSystem ?? 'unknown',
-                operation: options?.dbSqlVerb ?? extractSqlVerb(options?.dbSql) ?? operation,
-                ...(options?.dbTable !== undefined ? { table: options.dbTable } : {}),
-                duration_ms,
-              },
-            }
-          : {};
-      client.enqueue(
-        buildErrorEvent({
-          service: initConfig.service,
-          environment: initConfig.environment,
-          error,
-          context: {
-            ...dbCtx,
-            ...perf,
-          },
-        }),
-      );
-    }
+    safeRun('measure.captureError', () => captureMeasureError(operation, options, start, err));
     throw err;
   }
+  return out;
+}
+
+type QueryTelemetry = { dbOperation: string; attributes: Record<string, unknown> };
+
+function queryTelemetry(dbSystem: string, operationName: string, options: RunQueryOptions | undefined): QueryTelemetry {
+  const dbOperation = options?.sqlVerb ?? extractSqlVerb(options?.sql) ?? operationName;
+  return {
+    dbOperation,
+    attributes: {
+      db_system: dbSystem,
+      db_operation: dbOperation,
+      ...(options?.table !== undefined ? { db_table: options.table } : {}),
+      ...options?.attributes,
+    },
+  };
+}
+
+function captureQueryError(
+  dbSystem: string,
+  query: QueryTelemetry,
+  options: RunQueryOptions | undefined,
+  start: number,
+  err: unknown,
+): void {
+  if (options?.captureError === false) return;
+  const { client, initConfig } = getSdkRuntime();
+  if (!client || !initConfig) return;
+  client.enqueue(
+    buildErrorEvent({
+      service: initConfig.service,
+      environment: initConfig.environment,
+      error: asError(err),
+      context: {
+        db: {
+          system: dbSystem,
+          operation: query.dbOperation,
+          ...(options?.table !== undefined ? { table: options.table } : {}),
+          duration_ms: Math.round(performance.now() - start),
+        },
+      },
+    }),
+  );
 }
 
 /**
  * Database work: records a **db** span (duration + system / operation / table when provided).
  * On failure, emits an error event (same as legacy `measure` + `db` kind).
+ *
+ * O `try` envolve SÓ a query: se o span fosse emitido dentro dele e lançasse depois do commit, o
+ * `catch` relançaria o erro do SDK e a app faria retry de um INSERT que já aconteceu.
  */
 export async function runQuery<T>(
   dbSystem: string,
@@ -131,53 +184,38 @@ export async function runQuery<T>(
   fn: () => Promise<T> | T,
   options?: RunQueryOptions,
 ): Promise<T> {
-  const { client, initConfig } = getSdkRuntime();
-  const sqlVerb = options?.sqlVerb ?? extractSqlVerb(options?.sql);
-  const dbOperation = sqlVerb ?? operationName;
   const start = performance.now();
-  const attributes = {
-    db_system: dbSystem,
-    db_operation: dbOperation,
-    ...(options?.table !== undefined ? { db_table: options.table } : {}),
-    ...options?.attributes,
-  };
-  // `undefined` = nested mode (withSpan owns the span); `null` = leaf mode without an active trace.
-  const leafSpan = options?.leaf === true ? beginOutboundSpan() : undefined;
+  const query = isTelemetryActive()
+    ? safeRun('runQuery.setup', () => queryTelemetry(dbSystem, operationName, options))
+    : undefined;
+  if (query === undefined) {
+    return fn();
+  }
+  if (options?.leaf !== true) {
+    let nested: Awaited<T>;
+    try {
+      nested = await withSpan(operationName, fn, { type: 'db', attributes: query.attributes });
+    } catch (err) {
+      safeRun('runQuery.captureError', () => captureQueryError(dbSystem, query, options, start, err));
+      throw err;
+    }
+    return nested;
+  }
+  const leafSpan = beginOutboundSpan();
+  let out: Awaited<T>;
   try {
-    if (options?.leaf === true) {
-      const result = await Promise.resolve(fn());
-      if (leafSpan !== null && leafSpan !== undefined) {
-        endOutboundSpan(leafSpan, { name: operationName, type: 'db', attributes });
-      }
-      return result;
-    }
-    return await withSpan(operationName, () => Promise.resolve(fn()), {
-      type: 'db',
-      attributes,
-    });
+    out = await fn();
   } catch (err) {
-    const duration_ms = Math.round(performance.now() - start);
-    const error = err instanceof Error ? err : new Error(String(err));
-    if (leafSpan !== null && leafSpan !== undefined) {
-      endOutboundSpan(leafSpan, { name: operationName, type: 'db', attributes, err: error });
-    }
-    if (client && initConfig && options?.captureError !== false) {
-      client.enqueue(
-        buildErrorEvent({
-          service: initConfig.service,
-          environment: initConfig.environment,
-          error,
-          context: {
-            db: {
-              system: dbSystem,
-              operation: dbOperation,
-              ...(options?.table !== undefined ? { table: options.table } : {}),
-              duration_ms,
-            },
-          },
-        }),
-      );
-    }
+    safeRun('runQuery.end', () => {
+      if (leafSpan !== null) {
+        endOutboundSpan(leafSpan, { name: operationName, type: 'db', attributes: query.attributes, err: asError(err) });
+      }
+    });
+    safeRun('runQuery.captureError', () => captureQueryError(dbSystem, query, options, start, err));
     throw err;
   }
+  if (leafSpan !== null) {
+    endOutboundSpan(leafSpan, { name: operationName, type: 'db', attributes: query.attributes });
+  }
+  return out;
 }

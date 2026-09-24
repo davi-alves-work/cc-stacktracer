@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import type { ClientRequest, IncomingMessage } from 'node:http';
+import { isTelemetryActive, safeRun } from '../../core/safe-run.js';
 import { beginOutboundSpan, endOutboundSpan, type OutboundSpanStart } from '../../core/tracing.js';
 import { buildTraceparent } from '../../utils/traceparent.js';
 import { classifyOutboundUrl, sanitizedTarget } from './url-classification.js';
@@ -45,28 +46,6 @@ function resolveMethod(args: unknown[]): string {
   return typeof method === 'string' && method !== '' ? method.toUpperCase() : 'GET';
 }
 
-function withTraceparentHeader(headers: unknown, traceparent: string): Record<string, unknown> {
-  const base = isPlainObject(headers) ? headers : {};
-  return { ...base, traceparent };
-}
-
-/** Returns a copy of `args` with `traceparent` merged into the request options' headers. */
-function injectTraceparent(args: unknown[], traceparent: string): unknown[] {
-  const [first, second, third] = args;
-  if (isPlainObject(first)) {
-    return [{ ...first, headers: withTraceparentHeader(first.headers, traceparent) }, ...args.slice(1)];
-  }
-  // first is a url (string | URL)
-  if (isPlainObject(second)) {
-    return [first, { ...second, headers: withTraceparentHeader(second.headers, traceparent) }, ...args.slice(2)];
-  }
-  // (url) or (url, callback) — insert an options object carrying the header before any callback
-  const headerOpts = { headers: { traceparent } };
-  return second === undefined
-    ? [first, headerOpts]
-    : [first, headerOpts, ...(third === undefined ? [second] : [second, third])];
-}
-
 function attributesFor(
   url: URL,
   method: string,
@@ -87,47 +66,90 @@ function attributesFor(
   };
 }
 
+type OutboundPlan = {
+  url: URL;
+  method: string;
+  begin: OutboundSpanStart;
+  classification: ReturnType<typeof classifyOutboundUrl>;
+  name: string;
+};
+
+/** Tudo o que o SDK decide ANTES da chamada. `undefined` = esta chamada não é instrumentada. */
+function planOutbound(args: unknown[], isHttps: boolean, options: OutboundHttpOptions): OutboundPlan | undefined {
+  const url = resolveUrl(args, isHttps);
+  if (url === undefined) return undefined;
+  const begin = beginOutboundSpan();
+  if (begin === null) return undefined;
+  const classification = classifyOutboundUrl(url, options);
+  if (classification.kind === 'ignored') return undefined;
+  const method = resolveMethod(args);
+  return { url, method, begin, classification, name: `http.client ${method} ${url.host}` };
+}
+
+/**
+ * Observa a requisição sem mudar o que a app vê. Duas regras do Node guiam os listeners:
+ * sem listener de `'response'` o Node descarta o corpo sozinho, e sem listener de `'error'` o erro
+ * lança. Um listener nosso desligaria as duas — então, quando é o único, reproduzimos o padrão.
+ * `prependListener` porque callbacks `once` da app saem da lista antes dos listeners seguintes
+ * rodarem, e a contagem mentiria.
+ */
+function observe(req: ClientRequest, plan: OutboundPlan, propagate: boolean): void {
+  // Header via `setHeader` e não reescrevendo os argumentos da app: array de headers, objetos com
+  // protótipo e afins passam intocados. Se os headers já saíram na criação, não há propagação.
+  if (propagate && !req.headersSent) {
+    req.setHeader('traceparent', buildTraceparent(plan.begin.traceId, plan.begin.spanId, plan.begin.traceFlags));
+  }
+
+  let finished = false;
+  const finish = (status?: number, err?: Error): void => {
+    if (finished) return;
+    finished = true;
+    const errored =
+      err ??
+      (status !== undefined && status >= 500
+        ? Object.assign(new Error(`HTTP ${status}`), { name: 'HttpError' })
+        : undefined);
+    endOutboundSpan(plan.begin, {
+      name: plan.name,
+      type: 'external',
+      attributes: attributesFor(plan.url, plan.method, plan.begin, plan.classification, status),
+      ...(errored !== undefined ? { err: errored } : {}),
+    });
+  };
+
+  req.prependListener('response', (res: IncomingMessage) => {
+    safeRun('nodeHttp.response', () => finish(res.statusCode));
+    if (req.listenerCount('response') === 1) {
+      res.resume();
+    }
+  });
+  req.prependListener('error', (err: Error) => {
+    safeRun('nodeHttp.error', () => finish(undefined, err instanceof Error ? err : new Error(String(err))));
+    if (req.listenerCount('error') === 1) {
+      throw err;
+    }
+  });
+  req.on('timeout', () => {
+    safeRun('nodeHttp.timeout', () =>
+      finish(undefined, Object.assign(new Error('Request timeout'), { name: 'TimeoutError' })),
+    );
+  });
+  // Aborted / socket closed before a response: still close the span (no status).
+  req.on('close', () => {
+    safeRun('nodeHttp.close', () => finish());
+  });
+}
+
 function makeWrappedRequest(original: AnyRequest, isHttps: boolean, options: OutboundHttpOptions): AnyRequest {
   const propagate = options.propagateTraceparent !== false;
   return function instrumentedRequest(this: unknown, ...args: unknown[]): ClientRequest {
-    const url = resolveUrl(args, isHttps);
-    const begin = url !== undefined ? beginOutboundSpan() : null;
-    if (url === undefined || begin === null) {
-      return original.apply(this, args);
+    const plan = isTelemetryActive()
+      ? safeRun('nodeHttp.setup', () => planOutbound(args, isHttps, options))
+      : undefined;
+    const req = original.apply(this, args);
+    if (plan !== undefined) {
+      safeRun('nodeHttp.observe', () => observe(req, plan, propagate));
     }
-    const classification = classifyOutboundUrl(url, options);
-    if (classification.kind === 'ignored') {
-      return original.apply(this, args);
-    }
-
-    const method = resolveMethod(args);
-    const traceparent = buildTraceparent(begin.traceId, begin.spanId, begin.traceFlags);
-    const nextArgs = propagate ? injectTraceparent(args, traceparent) : args;
-    const req = original.apply(this, nextArgs);
-
-    const name = `http.client ${method} ${url.host}`;
-    let finished = false;
-    const finish = (status?: number, err?: Error): void => {
-      if (finished) return;
-      finished = true;
-      const errored =
-        err ??
-        (status !== undefined && status >= 500
-          ? Object.assign(new Error(`HTTP ${status}`), { name: 'HttpError' })
-          : undefined);
-      endOutboundSpan(begin, {
-        name,
-        type: 'external',
-        attributes: attributesFor(url, method, begin, classification, status),
-        ...(errored !== undefined ? { err: errored } : {}),
-      });
-    };
-
-    req.on('response', (res: IncomingMessage) => finish(res.statusCode));
-    req.on('error', (err: Error) => finish(undefined, err instanceof Error ? err : new Error(String(err))));
-    req.on('timeout', () => finish(undefined, Object.assign(new Error('Request timeout'), { name: 'TimeoutError' })));
-    // Aborted / socket closed before a response: still close the span (no status).
-    req.on('close', () => finish());
     return req;
   };
 }
@@ -141,6 +163,9 @@ function makeWrappedRequest(original: AnyRequest, isHttps: boolean, options: Out
  * `http.get` (incl. `follow-redirects`, used by axios) see the wrappers. Returns an uninstrument function.
  */
 export function instrumentNodeHttp(options: OutboundHttpOptions = {}): () => void {
+  if (!isTelemetryActive()) {
+    return () => {};
+  }
   const require = createRequire(import.meta.url);
   const restores: Array<() => void> = [];
 
@@ -155,7 +180,8 @@ export function instrumentNodeHttp(options: OutboundHttpOptions = {}): () => voi
     const wrappedRequest = makeWrappedRequest(originalRequest, isHttps, options);
 
     mod.request = wrappedRequest;
-    // `get` is `request` + `req.end()`; route it through the wrapped request so it shares one span.
+    // `get` is `request` + `req.end()`; route it through the wrapped request so it shares one span —
+    // and so `traceparent` is set before `end()` commits the headers.
     mod.get = function instrumentedGet(this: unknown, ...args: unknown[]): ClientRequest {
       const req = wrappedRequest.apply(this, args);
       req.end();

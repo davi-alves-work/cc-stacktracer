@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { init, shutdown } from '../index.js';
+import { getStackTraceClient, init, shutdown } from '../index.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
 import { createLucidStackTracePlugin, MAX_PENDING_LUCID_QUERIES } from './lucid.js';
 import type { StackTraceContext } from '../core/plugins/types.js';
@@ -51,6 +51,7 @@ function knexQueryEvent(uid: string, sql: string, method = 'select'): Record<str
 
 describe('db-lucid plugin', () => {
   afterEach(async () => {
+    vi.restoreAllMocks();
     await shutdown();
   });
 
@@ -229,5 +230,53 @@ describe('db-lucid plugin', () => {
     await vi.waitFor(() => expect(spans(transport).length).toBeGreaterThan(0));
     await sleep(30);
     expect(spans(transport)).toHaveLength(1);
+  });
+});
+
+describe('db-lucid plugin fail-open', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await shutdown();
+  });
+
+  it('eventos do knex nunca lançam de volta no executor da query quando emitir o span lança', async () => {
+    const { db } = await setupLucid();
+    vi.spyOn(getStackTraceClient()!, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+
+    await runWithTraceContext(traceId, rootSpanId, async () => {
+      const ok = knexQueryEvent('uid-fo-1', 'insert into "orders" ("id") values (?)', 'insert');
+      db.emit('query', { ...ok });
+      expect(() => db.emit('query-response', [], { ...ok }, {})).not.toThrow();
+
+      const failing = knexQueryEvent('uid-fo-2', 'insert into "orders" ("id") values (?)', 'insert');
+      db.emit('query', { ...failing });
+      expect(() => db.emit('query-error', new Error('deadlock'), { ...failing })).not.toThrow();
+    });
+  });
+
+  it('um payload do knex malformado nunca lança de volta no executor', async () => {
+    const { db } = await setupLucid();
+    const evil = {
+      get __knexQueryUid(): string {
+        throw new Error('getter boom');
+      },
+    };
+    await runWithTraceContext(traceId, rootSpanId, async () => {
+      expect(() => db.emit('query', evil)).not.toThrow();
+    });
+  });
+
+  it('só varre o começo de SQL gigante e ainda infere a tabela', async () => {
+    const { transport, db } = await setupLucid();
+    const values = Array.from({ length: 50_000 }, () => '(?)').join(', ');
+    await runWithTraceContext(traceId, rootSpanId, async () => {
+      const q = knexQueryEvent('uid-huge', `insert into "events" ("id") values ${values}`, 'insert');
+      db.emit('query', { ...q });
+      db.emit('query-response', [], { ...q }, {});
+    });
+    await vi.waitFor(() => expect(spans(transport).length).toBeGreaterThan(0));
+    expect(spans(transport)[0]?.db_table).toBe('events');
   });
 });

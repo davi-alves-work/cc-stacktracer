@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
+import { safeRun } from './safe-run.js';
 
 export type StackTraceScopeUser = {
   id: string;
@@ -56,11 +57,13 @@ export function runWithScope<T>(fn: () => T): T {
  * Email is never sent raw; an opaque hash is included when provided.
  */
 export function setUser(user: { id: string; email?: string; tenantId?: string }): void {
-  current().user = {
-    id: user.id,
-    ...(user.tenantId !== undefined ? { tenantId: user.tenantId } : {}),
-    ...(user.email !== undefined ? { emailHash: hashEmail(user.email) } : {}),
-  };
+  safeRun('setUser', () => {
+    current().user = {
+      id: user.id,
+      ...(user.tenantId !== undefined ? { tenantId: user.tenantId } : {}),
+      ...(typeof user.email === 'string' ? { emailHash: hashEmail(user.email) } : {}),
+    };
+  });
 }
 
 export function clearUser(): void {
@@ -72,10 +75,12 @@ export function tag(key: string, value: string): void {
 }
 
 export function setTags(record: Record<string, string>): void {
-  const state = current();
-  for (const [k, v] of Object.entries(record)) {
-    state.tags.set(k, v);
-  }
+  safeRun('setTags', () => {
+    const state = current();
+    for (const [k, v] of Object.entries(record)) {
+      state.tags.set(k, v);
+    }
+  });
 }
 
 export function clearTags(): void {

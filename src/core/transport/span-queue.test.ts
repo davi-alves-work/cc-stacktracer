@@ -209,3 +209,33 @@ describe('SpanQueue', () => {
     q.stop();
   });
 });
+
+describe('SpanQueue fail-open', () => {
+  it('descarta o lote da frente após maxDeliveryAttempts para os spans seguirem', async () => {
+    vi.useFakeTimers();
+    try {
+      const deliver = vi.fn().mockImplementation(async (batch: SdkSpanRow[]) => {
+        if (batch[0]?.span_id === 'poison') throw new TypeError('Do not know how to serialize a BigInt');
+      });
+      const q = new SpanQueue({
+        sendMode: 'batch',
+        maxBatchSize: 1,
+        flushIntervalMs: 60_000,
+        deliver,
+        maxDeliveryAttempts: 3,
+        retryBackoff: { random: () => 0.5, baseDelayMs: 10, maxDelayMs: 10 },
+      });
+
+      q.enqueue(span('poison'));
+      q.enqueue(span('good'));
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      const ids = deliver.mock.calls.map((call) => (call[0] as SdkSpanRow[])[0]?.span_id);
+      expect(ids.filter((id) => id === 'poison')).toHaveLength(3);
+      expect(ids).toContain('good');
+      q.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

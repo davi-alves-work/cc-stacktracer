@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { init, shutdown } from '../index.js';
+import { getStackTraceClient, init, shutdown } from '../index.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
 import { createPrismaStackTracePlugin, createStackTracePrismaQueryExtension } from './prisma.js';
 import type { StackTraceContext } from '../core/plugins/types.js';
@@ -76,6 +76,7 @@ async function middlewareFromPlugin(): Promise<PrismaMiddleware> {
 
 describe('db-prisma plugin', () => {
   afterEach(async () => {
+    vi.restoreAllMocks();
     await shutdown();
   });
 
@@ -239,6 +240,48 @@ describe('db-prisma plugin', () => {
       expect(result).toEqual([{ id: 7 }]);
       await sleep(30);
       expect(spans(transport)).toHaveLength(0);
+    });
+
+    it('uma query bem-sucedida continua bem-sucedida (e roda uma vez) mesmo se emitir o span lançar', async () => {
+      setup();
+      vi.spyOn(getStackTraceClient()!, 'enqueueSpan').mockImplementation(() => {
+        throw new Error('telemetry boom');
+      });
+      const { allOperations } = extensionHandlers();
+      const query = vi.fn(async () => ({ id: 1 }));
+
+      const result = await runWithTraceContext(traceId, rootSpanId, () =>
+        allOperations({ model: 'Order', operation: 'create', args: { data: {} }, query }),
+      );
+
+      expect(result).toEqual({ id: 1 });
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it('uma query que falha rejeita com o erro ORIGINAL mesmo se a telemetria também lançar', async () => {
+      setup();
+      const client = getStackTraceClient()!;
+      vi.spyOn(client, 'enqueueSpan').mockImplementation(() => {
+        throw new Error('telemetry boom');
+      });
+      vi.spyOn(client, 'enqueue').mockImplementation(() => {
+        throw new Error('telemetry boom');
+      });
+      const dbError = new Error('unique constraint');
+      const { allOperations } = extensionHandlers();
+
+      await expect(
+        runWithTraceContext(traceId, rootSpanId, () =>
+          allOperations({
+            model: 'Order',
+            operation: 'create',
+            args: {},
+            query: async () => {
+              throw dbError;
+            },
+          }),
+        ),
+      ).rejects.toBe(dbError);
     });
   });
 

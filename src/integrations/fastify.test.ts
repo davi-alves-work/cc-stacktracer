@@ -6,6 +6,8 @@ import { createStackTraceClient, init, shutdown } from '../index.js';
 import type { BatchTransportPayload } from '../core/stacktrace-client.js';
 import type { StackTraceEvent } from '../core/stacktrace-event.types.js';
 import stacktracePlugin from './fastify.js';
+import { resetFailOpenState } from '../core/safe-run.js';
+import type { StackTraceClient } from '../core/stacktrace-client.js';
 
 const serviceId = '11111111-1111-4111-8111-111111111111';
 
@@ -240,5 +242,60 @@ describe('Fastify plugin', () => {
     expect(sentPayloads(transport).some((item) => item.kind === 'batch')).toBe(false);
 
     await app.close();
+  });
+});
+
+describe('Fastify plugin fail-open', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    resetFailOpenState();
+    await shutdown();
+  });
+
+  function failOpenClient(transport = vi.fn().mockResolvedValue(undefined)): StackTraceClient {
+    return createStackTraceClient({
+      apiKey: 'k',
+      serviceId,
+      service: 'svc',
+      environment: 'test',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+    });
+  }
+
+  async function injectPing(client: StackTraceClient): Promise<{ statusCode: number; body: unknown }> {
+    const app = Fastify();
+    await app.register(stacktracePlugin, { client });
+    app.get('/ping', async () => ({ ok: true }));
+    const res = await app.inject({ method: 'GET', url: '/ping' });
+    await app.close();
+    return { statusCode: res.statusCode, body: res.json() };
+  }
+
+  it('atende a requisição quando o setup da telemetria lança', async () => {
+    const client = failOpenClient();
+    vi.spyOn(client, 'getHeaderRedactionOptions').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    await expect(injectPing(client)).resolves.toEqual({ statusCode: 200, body: { ok: true } });
+  });
+
+  it('envia a resposta quando emitir o span raiz lança no onSend', async () => {
+    const client = failOpenClient();
+    vi.spyOn(client, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    await expect(injectPing(client)).resolves.toEqual({ statusCode: 200, body: { ok: true } });
+  });
+
+  it('com STACKTRACE_DISABLED o plugin não instrumenta nada', async () => {
+    vi.stubEnv('STACKTRACE_DISABLED', '1');
+    resetFailOpenState();
+    const transport = vi.fn().mockResolvedValue(undefined);
+    await expect(injectPing(failOpenClient(transport))).resolves.toEqual({ statusCode: 200, body: { ok: true } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(transport).not.toHaveBeenCalled();
   });
 });

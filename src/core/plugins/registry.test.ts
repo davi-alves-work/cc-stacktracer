@@ -31,6 +31,22 @@ describe('plugin registry', () => {
     await initRegisteredPlugins();
     expect(spy).toHaveBeenCalledTimes(1);
   });
+
+  it('um plugin cujo init lança é pulado; os outros ainda inicializam', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const good = vi.fn();
+    register({
+      name: 'broken',
+      type: 'custom',
+      init: () => {
+        throw new Error('boom');
+      },
+    });
+    register({ name: 'good', type: 'custom', init: good });
+    await expect(initRegisteredPlugins()).resolves.toBeUndefined();
+    expect(good).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
+  });
 });
 
 describe('hasDependency', () => {

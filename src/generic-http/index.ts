@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { getStackTraceClient } from '../index.js';
 import { runWithRequestContext, type HttpRequestSnapshot } from '../core/request-context.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
+import { isTelemetryActive, safeRun } from '../core/safe-run.js';
 import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { extractCorrelationFromHeaders } from '../utils/correlation.js';
 import { headersToRecord } from '../utils/headers.js';
@@ -54,6 +55,8 @@ export class StackTraceHttpRequest {
 
   private readonly startTime: number;
   private readonly snapshot: HttpRequestSnapshot;
+  /** Sem telemetria (kill switch, fusível ou setup que falhou): `run` só executa e `end` não faz nada. */
+  private readonly inert: boolean;
   private ended = false;
 
   private constructor(params: {
@@ -64,6 +67,7 @@ export class StackTraceHttpRequest {
     startTime: number;
     request: StackTraceHttpRequestSnapshot;
     snapshot: HttpRequestSnapshot;
+    inert: boolean;
   }) {
     this.traceId = params.traceId;
     this.rootSpanId = params.rootSpanId;
@@ -76,9 +80,17 @@ export class StackTraceHttpRequest {
     this.startTime = params.startTime;
     this.request = params.request;
     this.snapshot = params.snapshot;
+    this.inert = params.inert;
   }
 
   static start(input: StackTraceHttpRequestInput): StackTraceHttpRequest {
+    const active = isTelemetryActive()
+      ? safeRun('genericHttp.start', () => StackTraceHttpRequest.startActive(input))
+      : undefined;
+    return active ?? StackTraceHttpRequest.startInert(input);
+  }
+
+  private static startActive(input: StackTraceHttpRequestInput): StackTraceHttpRequest {
     const client = getStackTraceClient();
     const rawHeaders = headersToRecord(headersWithOverrides(input));
     const correlation = extractCorrelationFromHeaders(rawHeaders);
@@ -110,18 +122,38 @@ export class StackTraceHttpRequest {
         headers,
       },
       snapshot,
+      inert: false,
+    });
+  }
+
+  private static startInert(input: StackTraceHttpRequestInput): StackTraceHttpRequest {
+    const method = typeof input?.method === 'string' ? input.method : '';
+    return new StackTraceHttpRequest({
+      traceId: randomBytes(16).toString('hex'),
+      rootSpanId: randomBytes(8).toString('hex'),
+      startTime: Date.now(),
+      request: { method, url: '', route: '', headers: {} },
+      snapshot: { method, url: '', headers: {} },
+      inert: true,
     });
   }
 
   async run<T>(fn: () => Promise<T> | T): Promise<T> {
+    if (this.inert) {
+      return fn();
+    }
     return runWithRequestContext(this.snapshot, () =>
       runWithTraceContext(this.traceId, this.rootSpanId, () => fn(), this.remoteParentSpanId, this.traceFlags),
     );
   }
 
   end(response: StackTraceHttpResponseInput): void {
-    if (this.ended) return;
+    if (this.inert || this.ended) return;
     this.ended = true;
+    safeRun('genericHttp.end', () => this.emitRootSpan(response));
+  }
+
+  private emitRootSpan(response: StackTraceHttpResponseInput): void {
     this.snapshot.statusCode = response.statusCode;
 
     const client = getStackTraceClient();

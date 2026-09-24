@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resetFailOpenState } from '../core/safe-run.js';
 import { createStackTraceClient } from '../index.js';
 import { stacktraceAdonisMiddleware, type AdonisHttpContextLike } from './adonis.js';
 
@@ -202,5 +203,81 @@ describe('Adonis middleware', () => {
     // Neither a request event nor a span is produced.
     await new Promise((r) => setTimeout(r, 20));
     expect(transport).not.toHaveBeenCalled();
+  });
+});
+
+describe('Adonis middleware fail-open', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    resetFailOpenState();
+  });
+
+  function failOpenClient(transport = vi.fn().mockResolvedValue(undefined)) {
+    return createStackTraceClient({
+      apiKey: 'k',
+      serviceId,
+      service: 'svc',
+      environment: 'test',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+    });
+  }
+
+  function ctxWith(handlers: Record<string, () => void>): AdonisHttpContextLike {
+    return {
+      request: { method: () => 'GET', url: () => '/ping', headers: () => ({}) },
+      response: {
+        getResponse: () => ({
+          statusCode: 200,
+          on: (event: string, cb: () => void) => {
+            handlers[event] = cb;
+          },
+        }),
+      },
+    };
+  }
+
+  it('chama next exatamente uma vez quando o setup da telemetria lança', async () => {
+    const client = failOpenClient();
+    vi.spyOn(client, 'getHeaderRedactionOptions').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    const next = vi.fn().mockResolvedValue(undefined);
+    await stacktraceAdonisMiddleware({ client })(ctxWith({}), next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('um throw ao emitir o span raiz não escapa do listener de finish', async () => {
+    const client = failOpenClient();
+    vi.spyOn(client, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    const handlers: Record<string, () => void> = {};
+    await stacktraceAdonisMiddleware({ client })(ctxWith(handlers), vi.fn().mockResolvedValue(undefined));
+    expect(() => handlers.finish!()).not.toThrow();
+  });
+
+  it('relança o erro da app pela identidade mesmo quando a captura lança', async () => {
+    const weird = {
+      toString(): string {
+        throw new Error('boom');
+      },
+    };
+    const next = vi.fn().mockRejectedValue(weird);
+    await expect(
+      stacktraceAdonisMiddleware({ client: failOpenClient(), captureErrors: true })(ctxWith({}), next),
+    ).rejects.toBe(weird);
+  });
+
+  it('com STACKTRACE_DISABLED só chama next e não registra listeners', async () => {
+    vi.stubEnv('STACKTRACE_DISABLED', '1');
+    resetFailOpenState();
+    const handlers: Record<string, () => void> = {};
+    const next = vi.fn().mockResolvedValue(undefined);
+    await stacktraceAdonisMiddleware({ client: failOpenClient() })(ctxWith(handlers), next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(Object.keys(handlers)).toEqual([]);
   });
 });

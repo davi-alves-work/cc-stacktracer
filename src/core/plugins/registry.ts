@@ -64,15 +64,20 @@ function sortPlugins(list: StackTracePlugin[]): StackTracePlugin[] {
 }
 
 /**
- * Runs `init` once per plugin name (after {@link register}).
+ * Runs `init` once per plugin name (after {@link register}). Um plugin que falha é pulado com um aviso
+ * — erro determinístico de integração no boot, que alguém precisa ver — e não impede os outros.
  */
 export async function initRegisteredPlugins(): Promise<void> {
   const ctx = buildContext();
   const ordered = sortPlugins(plugins);
   for (const p of ordered) {
     if (inited.has(p.name)) continue;
-    await Promise.resolve(p.init(ctx));
-    inited.add(p.name);
+    try {
+      await Promise.resolve(p.init(ctx));
+      inited.add(p.name);
+    } catch (err) {
+      console.warn(`[cc-stacktracer] plugin "${p.name}" failed to initialize and was skipped:`, err);
+    }
   }
 }
 

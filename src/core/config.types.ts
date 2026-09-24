@@ -29,6 +29,7 @@ export type StackTraceInitOptions = {
   sendMode?: SendMode;
   flushIntervalMs?: number;
   maxBatchSize?: number;
+  /** Teto de itens em memória por fila; o mais antigo sai primeiro. Default: 1.000 eventos e 10.000 spans. */
   maxQueueSize?: number;
   getHeaders?: () => Record<string, string>;
   beforeSend?: (event: StackTraceEvent) => StackTraceEvent | null;

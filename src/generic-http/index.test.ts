@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { getStackTraceClient, init, shutdown } from '../index.js';
+import { resetFailOpenState } from '../core/safe-run.js';
 import { StackTraceHttpRequest } from './index.js';
 
 describe('StackTraceHttpRequest', () => {
@@ -59,5 +61,57 @@ describe('StackTraceHttpRequest', () => {
         throw new Error('boom');
       }),
     ).rejects.toThrow('boom');
+  });
+});
+
+describe('StackTraceHttpRequest fail-open', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    await shutdown();
+    resetFailOpenState();
+  });
+
+  function initSdk(transport = vi.fn().mockResolvedValue(undefined)): ReturnType<typeof vi.fn> {
+    init({
+      apiKey: 'k',
+      serviceId: '11111111-1111-4111-8111-111111111111',
+      service: 'svc',
+      environment: 'test',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+    });
+    return transport;
+  }
+
+  it('start nunca lança: se o setup falhar, devolve um handle inerte que ainda executa o trabalho', async () => {
+    initSdk();
+    vi.spyOn(getStackTraceClient()!, 'getHeaderRedactionOptions').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    const trace = StackTraceHttpRequest.start({ method: 'GET', url: '/x', route: '/x' });
+    await expect(trace.run(async () => 'done')).resolves.toBe('done');
+    expect(() => trace.end({ statusCode: 200 })).not.toThrow();
+  });
+
+  it('end nunca lança quando emitir o span lança', () => {
+    initSdk();
+    vi.spyOn(getStackTraceClient()!, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    const trace = StackTraceHttpRequest.start({ method: 'GET', url: '/x', route: '/x' });
+    expect(() => trace.end({ statusCode: 200 })).not.toThrow();
+  });
+
+  it('com STACKTRACE_DISABLED o handle é inerte e nada é enviado', async () => {
+    const transport = initSdk();
+    vi.stubEnv('STACKTRACE_DISABLED', '1');
+    resetFailOpenState();
+    const trace = StackTraceHttpRequest.start({ method: 'GET', url: '/x', route: '/x' });
+    await expect(trace.run(async () => 'done')).resolves.toBe('done');
+    trace.end({ statusCode: 200 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(transport).not.toHaveBeenCalled();
   });
 });

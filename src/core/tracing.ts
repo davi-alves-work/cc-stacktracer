@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { getSdkRuntime } from './client-ref.js';
+import { isTelemetryActive, safeRun } from './safe-run.js';
 import type { SdkSpanRow } from './span-payload.types.js';
 import {
   currentParentSpanIdForChild,
@@ -75,6 +76,10 @@ function mergeBusinessAttributes(explicit: Record<string, unknown> | undefined):
   return explicit === undefined ? businessAttrs : { ...businessAttrs, ...explicit };
 }
 
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
 function buildRow(params: {
   name: string;
   spanId: string;
@@ -125,59 +130,98 @@ function buildRow(params: {
     db_operation: strAttr(attrs, 'db_operation') ?? null,
     db_table: strAttr(attrs, 'db_table') ?? null,
     db_duration_us,
-    error_type: params.err?.name ?? null,
-    error_message: params.err !== undefined ? params.err.message.slice(0, 16_000) : null,
+    error_type: typeof params.err?.name === 'string' ? params.err.name : null,
+    error_message: typeof params.err?.message === 'string' ? params.err.message.slice(0, 16_000) : null,
     trace_flags: strAttr(attrs, 'trace_flags') ?? null,
     attributes: spanAttributes(attrs),
   };
 }
 
-export async function withSpan<T>(name: string, fn: () => Promise<T> | T, options?: SpanOptions): Promise<T> {
+type ChildSpanStart = { spanId: string; parentSpanId: string | null; startIso: string; perfStart: number };
+
+/** `undefined` sem trace ativo. O push vem por último: se algo antes lançar, a pilha fica intacta. */
+function beginChildSpan(): ChildSpanStart | undefined {
   if (getTraceIdFromContext() === undefined) {
-    return Promise.resolve(fn());
+    return undefined;
   }
-  const parent = currentParentSpanIdForChild() ?? null;
-  const spanId = newSpanId();
-  pushActiveSpan(spanId);
-  const startIso = new Date().toISOString();
-  const perfStart = performance.now();
+  const start: ChildSpanStart = {
+    spanId: newSpanId(),
+    parentSpanId: currentParentSpanIdForChild() ?? null,
+    startIso: new Date().toISOString(),
+    perfStart: performance.now(),
+  };
+  pushActiveSpan(start.spanId);
+  return start;
+}
+
+function finishChildSpan(start: ChildSpanStart, name: string, options: SpanOptions | undefined, err?: Error): void {
   try {
-    const out = await Promise.resolve(fn());
-    const durationUs = (performance.now() - perfStart) * 1000;
-    const endIso = new Date().toISOString();
     const row = buildRow({
       name,
-      spanId,
-      parentSpanId: parent,
-      startIso,
-      endIso,
-      durationUs,
+      spanId: start.spanId,
+      parentSpanId: start.parentSpanId,
+      startIso: start.startIso,
+      endIso: new Date().toISOString(),
+      durationUs: (performance.now() - start.perfStart) * 1000,
       ...(options !== undefined ? { options } : {}),
+      ...(err !== undefined ? { err } : {}),
     });
     if (row !== null) {
       getSdkRuntime().client?.enqueueSpan(row);
     }
-    return out;
-  } catch (err) {
-    const durationUs = (performance.now() - perfStart) * 1000;
-    const endIso = new Date().toISOString();
-    const e = err instanceof Error ? err : new Error(String(err));
-    const row = buildRow({
-      name,
-      spanId,
-      parentSpanId: parent,
-      startIso,
-      endIso,
-      durationUs,
-      ...(options !== undefined ? { options } : {}),
-      err: e,
-    });
-    if (row !== null) {
-      getSdkRuntime().client?.enqueueSpan(row);
-    }
-    throw err;
   } finally {
     popActiveSpan();
+  }
+}
+
+/**
+ * O `try` envolve SÓ `fn`. Se a telemetria rodasse dentro dele, o `catch` confundiria a falha do SDK
+ * com a da app: um `fn` bem-sucedido viraria exceção, e a app faria retry de algo que já aconteceu.
+ */
+export async function withSpan<T>(name: string, fn: () => Promise<T> | T, options?: SpanOptions): Promise<T> {
+  const started = isTelemetryActive() ? safeRun('withSpan.start', beginChildSpan) : undefined;
+  if (started === undefined) {
+    return fn();
+  }
+  let out: Awaited<T>;
+  try {
+    out = await fn();
+  } catch (err) {
+    safeRun('withSpan.end', () => finishChildSpan(started, name, options, asError(err)));
+    throw err;
+  }
+  safeRun('withSpan.end', () => finishChildSpan(started, name, options));
+  return out;
+}
+
+type RootSpanStart = { traceId: string; spanId: string; startIso: string; perfStart: number; options: SpanOptions };
+
+function beginRootSpan(options: SpanOptions | undefined): RootSpanStart {
+  return {
+    traceId: randomBytes(16).toString('hex'),
+    spanId: newSpanId(),
+    startIso: new Date().toISOString(),
+    perfStart: performance.now(),
+    // Spread first, then apply the default: guards against a `type: undefined` explicitly present on
+    // `options` clobbering the default.
+    options: { ...options, type: options?.type ?? 'service' },
+  };
+}
+
+function finishRootSpan(root: RootSpanStart, name: string, err?: Error): void {
+  const row = buildRow({
+    name,
+    spanId: root.spanId,
+    parentSpanId: null,
+    startIso: root.startIso,
+    endIso: new Date().toISOString(),
+    durationUs: (performance.now() - root.perfStart) * 1000,
+    traceId: root.traceId,
+    options: root.options,
+    ...(err !== undefined ? { err } : {}),
+  });
+  if (row !== null) {
+    getSdkRuntime().client?.enqueueSpan(row);
   }
 }
 
@@ -196,77 +240,42 @@ export async function withTrace<T>(name: string, fn: () => Promise<T> | T, optio
   if (getTraceIdFromContext() !== undefined) {
     return withSpan(name, fn, options);
   }
-  const traceId = randomBytes(16).toString('hex');
-  const rootSpanId = newSpanId();
-  const startIso = new Date().toISOString();
-  const perfStart = performance.now();
-  // Spread first, then apply the default: guards against a `type: undefined` explicitly present on
-  // `options` clobbering the default. `exactOptionalPropertyTypes` blocks that from typed call sites,
-  // but this keeps the merge correct regardless of how `options` was produced.
-  const spanOptions: SpanOptions = { ...options, type: options?.type ?? 'service' };
-
-  const finish = (err?: Error): void => {
-    const row = buildRow({
-      name,
-      spanId: rootSpanId,
-      parentSpanId: null,
-      startIso,
-      endIso: new Date().toISOString(),
-      durationUs: (performance.now() - perfStart) * 1000,
-      traceId,
-      options: spanOptions,
-      ...(err !== undefined ? { err } : {}),
-    });
-    if (row !== null) {
-      getSdkRuntime().client?.enqueueSpan(row);
-    }
-  };
-
-  return runWithTraceContext(traceId, rootSpanId, async () => {
+  const root = isTelemetryActive() ? safeRun('withTrace.start', () => beginRootSpan(options)) : undefined;
+  if (root === undefined) {
+    return fn();
+  }
+  return runWithTraceContext(root.traceId, root.spanId, async () => {
+    let out: Awaited<T>;
     try {
-      const out = await Promise.resolve(fn());
-      finish();
-      return out;
+      out = await fn();
     } catch (err) {
-      finish(err instanceof Error ? err : new Error(String(err)));
+      safeRun('withTrace.end', () => finishRootSpan(root, name, asError(err)));
       throw err;
     }
+    safeRun('withTrace.end', () => finishRootSpan(root, name));
+    return out;
   });
 }
 
 export function startSpan(name: string, options?: SpanOptions): SpanHandle {
-  if (getTraceIdFromContext() === undefined) {
+  const started = isTelemetryActive() ? safeRun('startSpan.start', beginChildSpan) : undefined;
+  if (started === undefined) {
     return { end: () => {} };
   }
-  const parent = currentParentSpanIdForChild() ?? null;
-  const spanId = newSpanId();
-  pushActiveSpan(spanId);
-  const startIso = new Date().toISOString();
-  const perfStart = performance.now();
+  let ended = false;
   return {
     end: (err?: Error) => {
-      const durationUs = (performance.now() - perfStart) * 1000;
-      const endIso = new Date().toISOString();
-      const row = buildRow({
-        name,
-        spanId,
-        parentSpanId: parent,
-        startIso,
-        endIso,
-        durationUs,
-        ...(options !== undefined ? { options } : {}),
-        ...(err !== undefined ? { err } : {}),
-      });
-      if (row !== null) {
-        getSdkRuntime().client?.enqueueSpan(row);
+      if (ended) {
+        return;
       }
-      popActiveSpan();
+      ended = true;
+      safeRun('startSpan.end', () => finishChildSpan(started, name, options, err));
     },
   };
 }
 
 export function endSpan(handle: SpanHandle, err?: Error): void {
-  handle.end(err);
+  safeRun('endSpan', () => handle.end(err));
 }
 
 /**
@@ -286,18 +295,25 @@ export type OutboundSpanStart = {
 
 /** Begins an outbound client span from the active trace, or returns `null` when no trace is active. */
 export function beginOutboundSpan(): OutboundSpanStart | null {
-  const ctx = currentTraceContext();
-  if (ctx === undefined) {
+  if (!isTelemetryActive()) {
     return null;
   }
-  return {
-    traceId: ctx.traceId,
-    spanId: newSpanId(),
-    parentSpanId: ctx.parentSpanId ?? null,
-    traceFlags: ctx.traceFlags,
-    startIso: new Date().toISOString(),
-    perfStart: performance.now(),
-  };
+  return (
+    safeRun<OutboundSpanStart | null>('beginOutboundSpan', () => {
+      const ctx = currentTraceContext();
+      if (ctx === undefined) {
+        return null;
+      }
+      return {
+        traceId: ctx.traceId,
+        spanId: newSpanId(),
+        parentSpanId: ctx.parentSpanId ?? null,
+        traceFlags: ctx.traceFlags,
+        startIso: new Date().toISOString(),
+        perfStart: performance.now(),
+      };
+    }) ?? null
+  );
 }
 
 /** Finalizes and enqueues an outbound client span. Callers must guard against double-finalization. */
@@ -305,24 +321,24 @@ export function endOutboundSpan(
   begin: OutboundSpanStart,
   params: { name: string; type?: SpanOptions['type']; attributes?: Record<string, unknown>; err?: Error },
 ): void {
-  const durationUs = (performance.now() - begin.perfStart) * 1000;
-  const endIso = new Date().toISOString();
-  const options: SpanOptions = {
-    type: params.type ?? 'external',
-    ...(params.attributes !== undefined ? { attributes: params.attributes } : {}),
-  };
-  const row = buildRow({
-    name: params.name,
-    traceId: begin.traceId,
-    spanId: begin.spanId,
-    parentSpanId: begin.parentSpanId,
-    startIso: begin.startIso,
-    endIso,
-    durationUs,
-    options,
-    ...(params.err !== undefined ? { err: params.err } : {}),
+  safeRun('endOutboundSpan', () => {
+    const options: SpanOptions = {
+      type: params.type ?? 'external',
+      ...(params.attributes !== undefined ? { attributes: params.attributes } : {}),
+    };
+    const row = buildRow({
+      name: params.name,
+      traceId: begin.traceId,
+      spanId: begin.spanId,
+      parentSpanId: begin.parentSpanId,
+      startIso: begin.startIso,
+      endIso: new Date().toISOString(),
+      durationUs: (performance.now() - begin.perfStart) * 1000,
+      options,
+      ...(params.err !== undefined ? { err: params.err } : {}),
+    });
+    if (row !== null) {
+      getSdkRuntime().client?.enqueueSpan(row);
+    }
   });
-  if (row !== null) {
-    getSdkRuntime().client?.enqueueSpan(row);
-  }
 }

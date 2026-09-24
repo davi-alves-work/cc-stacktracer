@@ -26,4 +26,17 @@ export default tseslint.config(
       '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', caughtErrors: 'none' }],
     },
   },
+  {
+    // Telemetria nunca pode derrubar a app: uma promise sem dono vira unhandledRejection, que derruba o
+    // processo no Node >= 15. `runDetached` (src/core/safe-run.ts) é o jeito permitido de soltar uma.
+    files: ['src/**/*.ts'],
+    ignores: ['src/**/*.test.ts'],
+    languageOptions: {
+      parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
+    },
+    rules: {
+      '@typescript-eslint/no-floating-promises': ['error', { ignoreVoid: false }],
+      '@typescript-eslint/no-misused-promises': 'error',
+    },
+  },
 );

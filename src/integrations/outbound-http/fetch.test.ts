@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { init, instrumentFetch, shutdown } from '../../index.js';
+import { getStackTraceClient, init, instrumentFetch, shutdown } from '../../index.js';
+import { resetFailOpenState } from '../../core/safe-run.js';
 import { runWithTraceContext } from '../../core/trace-span-context.js';
 import type { BatchTransportPayload } from '../../core/stacktrace-client.js';
 import type { SdkSpanRow } from '../../core/span-payload.types.js';
@@ -35,8 +36,11 @@ describe('outbound fetch instrumentation', () => {
   afterEach(async () => {
     restore();
     restore = () => {};
+    vi.restoreAllMocks();
     await shutdown();
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    resetFailOpenState();
   });
 
   it('injects traceparent with the client span id and records an external span', async () => {
@@ -132,5 +136,89 @@ describe('outbound fetch instrumentation', () => {
 
     await vi.waitFor(() => expect(spans(transport).length).toBeGreaterThan(0));
     expect(spans(transport)).toHaveLength(1);
+  });
+
+  it('devolve a resposta real e chama a rede uma vez mesmo se emitir o span lançar', async () => {
+    setup();
+    vi.spyOn(getStackTraceClient()!, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    const original = vi.fn(async () => new Response('paid', { status: 201 }));
+    vi.stubGlobal('fetch', original);
+    restore = instrumentFetch();
+
+    await runWithTraceContext(traceId, rootSpanId, async () => {
+      const res = await fetch('https://payments.example.com/charge', { method: 'POST', body: '{}' });
+      expect(res.status).toBe(201);
+      expect(await res.text()).toBe('paid');
+    });
+    expect(original).toHaveBeenCalledTimes(1);
+  });
+
+  it('relança o erro de rede original pela identidade mesmo se emitir o span lançar', async () => {
+    setup();
+    vi.spyOn(getStackTraceClient()!, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    const networkError = new TypeError('fetch failed');
+    const original = vi.fn(async () => {
+      throw networkError;
+    });
+    vi.stubGlobal('fetch', original);
+    restore = instrumentFetch();
+
+    await runWithTraceContext(traceId, rootSpanId, async () => {
+      await expect(fetch('https://api.example.com/x')).rejects.toBe(networkError);
+    });
+    expect(original).toHaveBeenCalledTimes(1);
+  });
+
+  it('se o setup do SDK lançar, faz a chamada intocada — uma vez, com os argumentos da app', async () => {
+    setup();
+    const original = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response('ok'));
+    vi.stubGlobal('fetch', original);
+    restore = instrumentFetch();
+    const trickyInit = {
+      method: 'POST',
+      get headers(): HeadersInit {
+        throw new Error('boom');
+      },
+    } as RequestInit;
+
+    await runWithTraceContext(traceId, rootSpanId, async () => {
+      const res = await fetch('https://api.example.com/x', trickyInit);
+      expect(res.status).toBe(200);
+    });
+    expect(original).toHaveBeenCalledTimes(1);
+    expect(original.mock.calls[0]?.[1]).toBe(trickyInit);
+  });
+
+  it('init.headers substitui os headers do Request, como manda a spec do Fetch', async () => {
+    setup();
+    let sent: Headers | undefined;
+    const original = vi.fn(async (_input: unknown, reqInit?: RequestInit) => {
+      sent = new Headers(reqInit?.headers);
+      return new Response('ok');
+    });
+    vi.stubGlobal('fetch', original);
+    restore = instrumentFetch();
+
+    await runWithTraceContext(traceId, rootSpanId, async () => {
+      await fetch(new Request('https://api.example.com/x', { headers: { 'x-from-request': '1' } }), {
+        headers: { 'x-from-init': '2' },
+      });
+    });
+    expect(sent?.get('x-from-init')).toBe('2');
+    expect(sent?.get('x-from-request')).toBeNull();
+    expect(sent?.get('traceparent')).toMatch(/^00-/);
+  });
+
+  it('não faz patch do fetch com STACKTRACE_DISABLED', () => {
+    vi.stubEnv('STACKTRACE_DISABLED', '1');
+    resetFailOpenState();
+    const original = vi.fn(async () => new Response('ok'));
+    vi.stubGlobal('fetch', original);
+    restore = instrumentFetch();
+    expect(globalThis.fetch).toBe(original);
   });
 });

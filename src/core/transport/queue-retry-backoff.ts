@@ -49,3 +49,9 @@ function retryAfterMsFromError(err: unknown): number | undefined {
   }
   return undefined;
 }
+
+/** Tentativas do lote da frente antes de descartá-lo: um lote que nunca passa não pode travar a fila. */
+export const DEFAULT_MAX_DELIVERY_ATTEMPTS = 10;
+
+/** Envios simultâneos no modo `immediate`: sem teto, um pico de erros vira milhares de sockets abertos. */
+export const MAX_IN_FLIGHT_IMMEDIATE = 64;

@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CapturePolicyCache } from './CapturePolicyCache.js';
+import { DEFAULT_COMPILED_CAPTURE_POLICY } from '../../shared/schema/index.js';
+import { resetFailOpenState, setInternalFailureSink } from '../../core/safe-run.js';
 
 const serviceId = '11111111-1111-4111-8111-111111111111';
 
@@ -166,6 +168,95 @@ describe('CapturePolicyCache polling', () => {
     await flushMicrotasks();
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
+    policyCache.stop();
+  });
+});
+
+describe('CapturePolicyCache fail-open', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    resetFailOpenState();
+  });
+
+  it('getHeaders que lança vira falha de fetch: reportada, com backoff, nunca rejeição sem dono', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okPolicyResponse());
+    vi.stubGlobal('fetch', fetchMock);
+    const fetchErrors: unknown[] = [];
+    const policyCache = new CapturePolicyCache({
+      apiKey: 'k',
+      endpoint: 'https://ingest.example.com',
+      serviceId,
+      refreshMs: 60_000,
+      random: () => 0,
+      getHeaders: () => {
+        throw new Error('header factory bug');
+      },
+      onFetchError: (err) => {
+        fetchErrors.push(err);
+      },
+    });
+
+    policyCache.start();
+    await vi.waitFor(() => expect(fetchErrors).toHaveLength(1));
+    expect(fetchErrors[0]).toMatchObject({ message: 'header factory bug' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    policyCache.stop();
+  });
+
+  it('onFetchError que lança não escapa como rejeição sem dono', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network down')));
+    const sink = vi.fn();
+    setInternalFailureSink(sink);
+    const policyCache = new CapturePolicyCache({
+      apiKey: 'k',
+      endpoint: 'https://ingest.example.com',
+      serviceId,
+      refreshMs: 60_000,
+      random: () => 0,
+      onFetchError: () => {
+        throw new Error('callback bug');
+      },
+    });
+
+    policyCache.start();
+    await vi.waitFor(() =>
+      expect(sink).toHaveBeenCalledWith(
+        'capturePolicy.onFetchError',
+        expect.objectContaining({ message: 'callback bug' }),
+      ),
+    );
+    policyCache.stop();
+  });
+
+  it('onNotices que lança nunca impede a política nova de valer', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          success: true,
+          data: {
+            capturePolicy: { enabled: false, notices: [{ code: 'no_data', severity: 'warn', params: {} }] },
+          },
+        }),
+      } as Response),
+    );
+    const policyCache = new CapturePolicyCache({
+      apiKey: 'k',
+      endpoint: 'https://ingest.example.com',
+      serviceId,
+      refreshMs: 60_000,
+      random: () => 0,
+      onNotices: () => {
+        throw new Error('notice reporter bug');
+      },
+    });
+
+    policyCache.start();
+    await vi.waitFor(() => expect(policyCache.getPolicy()).not.toBe(DEFAULT_COMPILED_CAPTURE_POLICY));
     policyCache.stop();
   });
 });

@@ -1,7 +1,14 @@
 import type { SdkSpanRow } from '../span-payload.types.js';
+import { runDetached } from '../safe-run.js';
 import { chunkBatches } from './batch-sender.js';
 import { isPermanentIngestError } from './ingest-transport-error.js';
-import { nextQueueRetryDelayMs, resetQueueRetryTimer, type QueueRetryBackoffOptions } from './queue-retry-backoff.js';
+import {
+  DEFAULT_MAX_DELIVERY_ATTEMPTS,
+  MAX_IN_FLIGHT_IMMEDIATE,
+  nextQueueRetryDelayMs,
+  resetQueueRetryTimer,
+  type QueueRetryBackoffOptions,
+} from './queue-retry-backoff.js';
 
 export type SpanQueueSendMode = 'batch' | 'immediate';
 
@@ -14,6 +21,8 @@ export type SpanQueueOptions = {
   onMetric?: (metric: SpanQueueMetric) => void;
   logger?: SpanQueueLogger;
   retryBackoff?: QueueRetryBackoffOptions;
+  /** Tentativas do lote da frente antes de descartá-lo. Default {@link DEFAULT_MAX_DELIVERY_ATTEMPTS}. */
+  maxDeliveryAttempts?: number;
 };
 
 export type SpanQueueMetricName =
@@ -53,12 +62,14 @@ export class SpanQueue {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retryNotBefore = 0;
   private consecutiveFailures = 0;
+  private headAttempts = 0;
+  private inFlightImmediate = 0;
 
   constructor(private readonly options: SpanQueueOptions) {}
 
   enqueue(row: SdkSpanRow): void {
     if (this.options.sendMode === 'immediate') {
-      void this.options.deliver([row]).catch(() => undefined);
+      this.deliverImmediately(row);
       return;
     }
 
@@ -69,7 +80,23 @@ export class SpanQueue {
     this.queue.push(row);
     this.emitPendingMetric();
     this.ensureInterval();
-    void this.runFlush(false);
+    runDetached('spanQueue.flush', () => this.runFlush(false));
+  }
+
+  private deliverImmediately(row: SdkSpanRow): void {
+    if (this.inFlightImmediate >= MAX_IN_FLIGHT_IMMEDIATE) {
+      return;
+    }
+    this.inFlightImmediate += 1;
+    runDetached('spanQueue.deliverImmediate', async () => {
+      try {
+        await this.options.deliver([row]);
+      } catch {
+        // falha de transporte, não do SDK: `onTransportError` já foi avisado dentro de `deliver`
+      } finally {
+        this.inFlightImmediate -= 1;
+      }
+    });
   }
 
   async flushPending(): Promise<void> {
@@ -96,7 +123,7 @@ export class SpanQueue {
       return;
     }
     this.intervalHandle = setInterval(() => {
-      void this.runFlush(true);
+      runDetached('spanQueue.flush', () => this.runFlush(true));
     }, this.options.flushIntervalMs);
     this.intervalHandle.unref();
   }
@@ -188,6 +215,7 @@ export class SpanQueue {
 
     const minBatch = limit !== undefined ? 1 : this.options.maxBatchSize;
     const chunks = chunkBatches(this.queue.slice(0, count), this.options.maxBatchSize);
+    const maxAttempts = this.options.maxDeliveryAttempts ?? DEFAULT_MAX_DELIVERY_ATTEMPTS;
 
     let delivered = 0;
     for (const chunk of chunks) {
@@ -209,7 +237,9 @@ export class SpanQueue {
           },
           'spanqueue_flush_failed',
         );
-        if (isPermanentIngestError(err)) {
+        this.headAttempts += 1;
+        if (isPermanentIngestError(err) || this.headAttempts >= maxAttempts) {
+          this.headAttempts = 0;
           delivered += chunk.length;
           continue;
         }
@@ -227,6 +257,7 @@ export class SpanQueue {
 
   private resetBackoff(): void {
     this.consecutiveFailures = 0;
+    this.headAttempts = 0;
     this.retryNotBefore = 0;
     this.retryTimer = resetQueueRetryTimer(this.retryTimer);
   }
@@ -242,7 +273,7 @@ export class SpanQueue {
     this.retryTimer = resetQueueRetryTimer(this.retryTimer);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
-      void this.runFlush(false);
+      runDetached('spanQueue.retry', () => this.runFlush(false));
     }, delayMs);
     this.retryTimer.unref?.();
   }

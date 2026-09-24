@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { StackTracePlugin } from '../core/plugins/types.js';
 import { runWithRequestContextAsync, type HttpRequestSnapshot } from '../core/request-context.js';
+import { isTelemetryActive, safeRun } from '../core/safe-run.js';
 import type { StackTraceClient } from '../core/stacktrace-client.js';
 import { getStackTraceClient } from '../index.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
@@ -44,103 +45,128 @@ function getClient(opts: StacktraceAdonisOptions | undefined): StackTraceClient 
   return getStackTraceClient();
 }
 
+type RequestTelemetry = {
+  snapshot: HttpRequestSnapshot;
+  traceId: string;
+  rootSpanId: string;
+  parentSpanId: string | undefined;
+  traceFlags: string | undefined;
+  raw: ReturnType<AdonisHttpContextLike['response']['getResponse']>;
+  emit: (aborted: boolean) => void;
+};
+
+function prepareRequest(ctx: AdonisHttpContextLike, opts: StacktraceAdonisOptions | undefined): RequestTelemetry {
+  const start = Date.now();
+  const method = ctx.request.method();
+  const url = ctx.request.url();
+  const rawHeaders = ctx.request.headers();
+  const client = getClient(opts);
+  const correlation = extractCorrelationFromHeaders(rawHeaders);
+  const headers = redactHeaders(rawHeaders, { maxValueLength: 512, ...client?.getHeaderRedactionOptions() });
+  const snapshot: HttpRequestSnapshot = { method, url: redactUrl(url, client?.getUrlRedactionOptions()), headers };
+  const raw = ctx.response.getResponse();
+  const emitHttpRootSpan = opts?.emitHttpRootSpan !== false;
+  const traceId = correlation.traceId ?? randomBytes(16).toString('hex');
+  const rootSpanId = randomBytes(8).toString('hex');
+
+  // Emit the root span exactly once, however the request ends. `finish` covers a completed
+  // response; `close` is the fallback for aborted/timed-out connections where `finish` never
+  // fires — without it the server span (which carries the route) is lost and the child spans
+  // are left orphaned.
+  let emitted = false;
+  const emit = (aborted: boolean): void => {
+    if (emitted) return;
+    emitted = true;
+    if (!client) return;
+    const durationMs = Date.now() - start;
+    const statusCode = raw.statusCode ?? 200;
+    snapshot.statusCode = statusCode;
+    const pathOnly = url.split('?')[0] ?? url;
+    const routePattern = ctx.route?.pattern;
+    const endpoint = typeof routePattern === 'string' && routePattern.trim() !== '' ? routePattern : pathOnly;
+
+    if (!client.shouldCaptureHttpRequest({ endpoint, status_code: statusCode })) {
+      return;
+    }
+    if (!emitHttpRootSpan) {
+      return;
+    }
+
+    /** Use closure ids: `on("finish")` may run outside ALS, so avoid getTraceIdFromContext() here. */
+    const startIso = new Date(start).toISOString();
+    const endIso = new Date().toISOString();
+    const routeLabel = typeof routePattern === 'string' && routePattern !== '' ? routePattern : pathOnly;
+    const httpRoute = normalizeHttpRouteForSpan(method, routeLabel) ?? routeLabel;
+    client.enqueueSpan({
+      span_timestamp: endIso,
+      trace_id: traceId,
+      span_id: rootSpanId,
+      parent_span_id: correlation.parentSpanId ?? null,
+      service_name: client.getServiceDescriptor().name,
+      service_version: client.getServiceDescriptor().version,
+      environment: client.getEnvironment(),
+      span_name: `${method} ${routeLabel}`.slice(0, 1024),
+      span_type: 'http',
+      start_time: startIso,
+      end_time: endIso,
+      duration_us: Math.max(0, Math.round(durationMs * 1000)),
+      ...httpRootSpanOutcome(aborted, statusCode),
+      http_method: method,
+      http_route: httpRoute.slice(0, 4096),
+    });
+  };
+
+  return {
+    snapshot,
+    traceId,
+    rootSpanId,
+    parentSpanId: correlation.parentSpanId,
+    traceFlags: correlation.traceFlags,
+    raw,
+    emit,
+  };
+}
+
 /**
- * AdonisJS v6-style HTTP middleware: (ctx, next). Captures method, url, redacted headers, statusCode, durationMs.
- * Establishes the same request + trace AsyncLocalStorage scope as the Fastify plugin so {@link withSpan} / span
- * rows correlate, and emits a root HTTP span when {@link StacktraceAdonisOptions.emitHttpRootSpan} is true.
+ * AdonisJS v6-style HTTP middleware: (ctx, next). Establishes the same request + trace AsyncLocalStorage
+ * scope as the Fastify plugin so {@link withSpan} / span rows correlate, and emits a root HTTP span when
+ * {@link StacktraceAdonisOptions.emitHttpRootSpan} is true.
+ *
+ * `next()` roda exatamente uma vez e o erro dele sobe intacto; a telemetria em volta nunca lança.
  */
 export function stacktraceAdonisMiddleware(
   opts?: StacktraceAdonisOptions,
 ): (ctx: AdonisHttpContextLike, next: () => Promise<void>) => Promise<void> {
   return async (ctx: AdonisHttpContextLike, next: () => Promise<void>) => {
-    const start = Date.now();
-    const method = ctx.request.method();
-    const url = ctx.request.url();
-    const rawHeaders = ctx.request.headers();
-    const client = getClient(opts);
-    const correlation = extractCorrelationFromHeaders(rawHeaders);
-    const headers = redactHeaders(rawHeaders, { maxValueLength: 512, ...client?.getHeaderRedactionOptions() });
-    const redactedUrl = redactUrl(url, client?.getUrlRedactionOptions());
-    const snapshot: HttpRequestSnapshot = { method, url: redactedUrl, headers };
-    const raw = ctx.response.getResponse();
-    const emitHttpRootSpan = opts?.emitHttpRootSpan !== false;
-    const traceId = correlation.traceId ?? randomBytes(16).toString('hex');
-    const rootSpanId = randomBytes(8).toString('hex');
-
-    // Emit the root span exactly once, however the request ends. `finish` covers a completed
-    // response; `close` is the fallback for aborted/timed-out connections where `finish` never
-    // fires — without it the server span (which carries the route) is lost and the child spans
-    // are left orphaned.
-    let emitted = false;
-    const emit = (aborted: boolean): void => {
-      if (emitted) return;
-      emitted = true;
-      if (!client) return;
-      const durationMs = Date.now() - start;
-      const statusCode = raw.statusCode ?? 200;
-      snapshot.statusCode = statusCode;
-      const pathOnly = url.split('?')[0] ?? url;
-      const routePattern = ctx.route?.pattern;
-      const endpoint = typeof routePattern === 'string' && routePattern.trim() !== '' ? routePattern : pathOnly;
-
-      if (
-        !client.shouldCaptureHttpRequest({
-          endpoint,
-          status_code: statusCode,
-        })
-      ) {
-        return;
-      }
-
-      if (!emitHttpRootSpan) {
-        return;
-      }
-
-      /** Use closure ids: `on("finish")` may run outside ALS, so avoid getTraceIdFromContext() here. */
-      const startIso = new Date(start).toISOString();
-      const endIso = new Date().toISOString();
-      const routeLabel = typeof routePattern === 'string' && routePattern !== '' ? routePattern : pathOnly;
-      const httpRoute = normalizeHttpRouteForSpan(method, routeLabel) ?? routeLabel;
-      client.enqueueSpan({
-        span_timestamp: endIso,
-        trace_id: traceId,
-        span_id: rootSpanId,
-        parent_span_id: correlation.parentSpanId ?? null,
-        service_name: client.getServiceDescriptor().name,
-        service_version: client.getServiceDescriptor().version,
-        environment: client.getEnvironment(),
-        span_name: `${method} ${routeLabel}`.slice(0, 1024),
-        span_type: 'http',
-        start_time: startIso,
-        end_time: endIso,
-        duration_us: Math.max(0, Math.round(durationMs * 1000)),
-        ...httpRootSpanOutcome(aborted, statusCode),
-        http_method: method,
-        http_route: httpRoute.slice(0, 4096),
-      });
-    };
-
-    await runWithRequestContextAsync(snapshot, async () =>
+    const telemetry = isTelemetryActive() ? safeRun('adonis.setup', () => prepareRequest(ctx, opts)) : undefined;
+    if (telemetry === undefined) {
+      return next();
+    }
+    await runWithRequestContextAsync(telemetry.snapshot, async () =>
       runWithTraceContext(
-        traceId,
-        rootSpanId,
+        telemetry.traceId,
+        telemetry.rootSpanId,
         async () => {
-          if (typeof raw.on === 'function') {
-            raw.on('finish', () => emit(false));
-            raw.on('close', () => emit(true));
-          }
+          const { raw } = telemetry;
+          const listening =
+            safeRun('adonis.listeners', () => {
+              if (typeof raw.on !== 'function') return false;
+              raw.on('finish', () => safeRun('adonis.finish', () => telemetry.emit(false)));
+              raw.on('close', () => safeRun('adonis.close', () => telemetry.emit(true)));
+              return true;
+            }) === true;
           try {
             await next();
           } catch (err) {
-            captureBoundaryError(err, opts);
+            safeRun('adonis.captureError', () => captureBoundaryError(err, opts));
             throw err;
           }
-          if (typeof raw.on !== 'function') {
-            emit(false);
+          if (!listening) {
+            safeRun('adonis.emit', () => telemetry.emit(false));
           }
         },
-        correlation.parentSpanId,
-        correlation.traceFlags,
+        telemetry.parentSpanId,
+        telemetry.traceFlags,
       ),
     );
   };

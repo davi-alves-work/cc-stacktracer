@@ -1,7 +1,10 @@
 import { buildErrorEvent } from './capture/build-error-event.js';
 import { buildLogEvent } from './capture/build-log-event.js';
 import { setSdkRuntime, getSdkRuntime } from './core/client-ref.js';
-import { parseStackTraceInit } from './core/config.schema.js';
+import { resetFailOpenState, safeRun, safeRunAsync, setInternalFailureSink } from './core/safe-run.js';
+import { parseStackTraceInit, type ParsedStackTraceInit } from './core/config.schema.js';
+import { buildInternalFailureSink, reportInvalidConfig } from './core/init-diagnostics.js';
+import { isSdkDisabledByEnv } from './core/kill-switch.js';
 import type { StackTraceAutoOptions, StackTraceInitOptions } from './core/config.types.js';
 import type { StackTracePlugin } from './core/plugins/types.js';
 import {
@@ -11,7 +14,7 @@ import {
   use as usePlugin,
 } from './core/plugins/registry.js';
 import { hasDependency, loadAutoPlugins } from './core/plugins/auto-loader.js';
-import { registerGlobalHandlers } from './core/global-handlers.js';
+import { registerGlobalHandlers, unregisterGlobalHandlers } from './core/global-handlers.js';
 import { clearTags, clearUser, resetScopeMetadata, setTags, setUser, tag } from './core/scope-metadata.js';
 import { withBusinessContext, withBusinessContextAsync } from './core/business-context.js';
 import { createStackTraceClient, StackTraceClient, type BatchTransportPayload } from './core/stacktrace-client.js';
@@ -29,11 +32,51 @@ export function getStackTraceClient(): StackTraceClient | null {
   return getSdkRuntime().client;
 }
 
+const FLUSH_DEADLINE_MS = 5_000;
+
+/**
+ * Resolve quando `work` termina ou quando o prazo vence — o que vier primeiro. Um ingest lento não pode
+ * segurar o graceful shutdown da app além do grace period do orquestrador.
+ */
+function withDeadline(work: Promise<void>, ms: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref();
+    work.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 /**
  * Initialize the SDK. Call once at startup. Re-initializing replaces the previous client.
+ *
+ * Nunca lança. Config inválida vira um `console.error` e SDK desligado; `STACKTRACE_DISABLED` desliga
+ * antes mesmo de ler a config — assim uma config quebrada mais o kill switch ainda deixa a app subir.
  */
 export function init(options: StackTraceInitOptions): void {
-  const parsed = parseStackTraceInit(options);
+  resetFailOpenState();
+  if (isSdkDisabledByEnv()) {
+    return;
+  }
+  let parsed: ParsedStackTraceInit;
+  try {
+    parsed = parseStackTraceInit(options);
+  } catch (err) {
+    reportInvalidConfig(err);
+    return;
+  }
+  safeRun('init', () => startClient(parsed));
+}
+
+function startClient(parsed: ParsedStackTraceInit): void {
   const previous = getSdkRuntime().client;
   if (previous !== null) {
     previous.detachScheduling();
@@ -51,6 +94,7 @@ export function init(options: StackTraceInitOptions): void {
     ...(parsed.tenantId !== undefined ? { tenantId: parsed.tenantId } : {}),
     ...(parsed.projectId !== undefined ? { projectId: parsed.projectId } : {}),
   });
+  setInternalFailureSink(buildInternalFailureSink(parsed));
   if (parsed.enableGlobalHandlers) {
     registerGlobalHandlers({
       captureException: (err) => {
@@ -74,29 +118,33 @@ export function init(options: StackTraceInitOptions): void {
 }
 
 export function captureException(error: Error, context?: Record<string, unknown>): void {
-  const { client, initConfig } = getSdkRuntime();
-  if (!client || !initConfig) return;
-  client.enqueue(
-    buildErrorEvent({
-      service: initConfig.service,
-      environment: initConfig.environment,
-      error,
-      ...(context !== undefined ? { context } : {}),
-    }),
-  );
+  safeRun('captureException', () => {
+    const { client, initConfig } = getSdkRuntime();
+    if (!client || !initConfig) return;
+    client.enqueue(
+      buildErrorEvent({
+        service: initConfig.service,
+        environment: initConfig.environment,
+        error,
+        ...(context !== undefined ? { context } : {}),
+      }),
+    );
+  });
 }
 
 export function log(message: string, metadata?: Record<string, unknown>): void {
-  const { client, initConfig } = getSdkRuntime();
-  if (!client || !initConfig) return;
-  client.enqueue(
-    buildLogEvent({
-      service: initConfig.service,
-      environment: initConfig.environment,
-      message,
-      ...(metadata !== undefined ? { context: metadata } : {}),
-    }),
-  );
+  safeRun('log', () => {
+    const { client, initConfig } = getSdkRuntime();
+    if (!client || !initConfig) return;
+    client.enqueue(
+      buildLogEvent({
+        service: initConfig.service,
+        environment: initConfig.environment,
+        message,
+        ...(metadata !== undefined ? { context: metadata } : {}),
+      }),
+    );
+  });
 }
 
 export type StructuredLogInput = {
@@ -110,46 +158,50 @@ export type StructuredLogInput = {
 };
 
 export function logStructured(params: StructuredLogInput): void {
-  const { client, initConfig } = getSdkRuntime();
-  if (!client || !initConfig) return;
-  const perfFields: Record<string, unknown> = {};
-  if (params.operation !== undefined) perfFields.operation = params.operation;
-  if (params.duration_ms !== undefined) perfFields.duration_ms = params.duration_ms;
-  const hasPerf = Object.keys(perfFields).length > 0;
-  let contextAttrs: Record<string, unknown> | undefined;
-  if (params.attributes !== undefined) {
-    contextAttrs = { ...params.attributes };
-    if (hasPerf) {
-      const prev = contextAttrs.performance;
-      const prevObj =
-        typeof prev === 'object' && prev !== null && !Array.isArray(prev)
-          ? { ...(prev as Record<string, unknown>) }
-          : {};
-      contextAttrs.performance = { ...prevObj, ...perfFields };
+  safeRun('logStructured', () => {
+    const { client, initConfig } = getSdkRuntime();
+    if (!client || !initConfig) return;
+    const perfFields: Record<string, unknown> = {};
+    if (params.operation !== undefined) perfFields.operation = params.operation;
+    if (params.duration_ms !== undefined) perfFields.duration_ms = params.duration_ms;
+    const hasPerf = Object.keys(perfFields).length > 0;
+    let contextAttrs: Record<string, unknown> | undefined;
+    if (params.attributes !== undefined) {
+      contextAttrs = { ...params.attributes };
+      if (hasPerf) {
+        const prev = contextAttrs.performance;
+        const prevObj =
+          typeof prev === 'object' && prev !== null && !Array.isArray(prev)
+            ? { ...(prev as Record<string, unknown>) }
+            : {};
+        contextAttrs.performance = { ...prevObj, ...perfFields };
+      }
+    } else if (hasPerf) {
+      contextAttrs = { performance: perfFields };
     }
-  } else if (hasPerf) {
-    contextAttrs = { performance: perfFields };
-  }
-  client.enqueue(
-    buildLogEvent({
-      service: initConfig.service,
-      environment: initConfig.environment,
-      message: params.message,
-      level: params.level,
-      ...(contextAttrs !== undefined ? { context: contextAttrs } : {}),
-    }),
-  );
+    client.enqueue(
+      buildLogEvent({
+        service: initConfig.service,
+        environment: initConfig.environment,
+        message: params.message,
+        level: params.level,
+        ...(contextAttrs !== undefined ? { context: contextAttrs } : {}),
+      }),
+    );
+  });
 }
 
 export async function flush(): Promise<void> {
   const { client } = getSdkRuntime();
-  if (client) await client.flush();
+  if (client === null) return;
+  await safeRunAsync('flush', () => withDeadline(client.flush(), FLUSH_DEADLINE_MS));
 }
 
 export async function shutdown(): Promise<void> {
   const { client } = getSdkRuntime();
-  if (client) {
-    await client.shutdown();
+  unregisterGlobalHandlers();
+  if (client !== null) {
+    await safeRunAsync('shutdown', () => withDeadline(client.shutdown(), FLUSH_DEADLINE_MS));
     setSdkRuntime(null, null);
   }
   resetScopeMetadata();
@@ -161,6 +213,9 @@ export async function shutdown(): Promise<void> {
 export async function auto(options: StackTraceAutoOptions): Promise<void> {
   const { fastify, prisma, lucid, outboundHttp, ...initOpts } = options;
   init(initOpts);
+  if (getSdkRuntime().client === null) {
+    return;
+  }
   // D2: outbound instrumentation is opt-in — only wired when explicitly requested.
   if (outboundHttp?.instrumentFetch === true) {
     instrumentFetch(outboundHttp);

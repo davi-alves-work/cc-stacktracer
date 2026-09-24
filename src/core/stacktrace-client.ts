@@ -15,11 +15,16 @@ import { SpanQueue } from './transport/span-queue.js';
 import { sendWithFetch } from './transport/default-fetch-transport.js';
 import { IngestTransportError } from './transport/ingest-transport-error.js';
 import { signIngestionRequest } from './transport/ingestion-signing.js';
+import { toJsonSafe } from './transport/json-safe.js';
+import { isTelemetryActive, reportInternalFailure } from './safe-run.js';
 
 const DEFAULT_MAX_BATCH_SIZE = 50;
 const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const DEFAULT_INGEST_PATH = '/v1/events';
 const DEFAULT_SPANS_PATH = '/v1/spans';
+/** Com o ingest fora do ar a fila só cresce: sem teto, a memória da app vira o limite. */
+const DEFAULT_MAX_QUEUE_SIZE = 1_000;
+const DEFAULT_MAX_SPAN_QUEUE_SIZE = 10_000;
 
 /** Path da URL do POST, alinhado com `req.url` do Fastify na canónica do servidor (sem query). */
 function ingestPathForSignature(fullUrl: string, fallback: string): string {
@@ -119,40 +124,55 @@ export class StackTraceClient {
       sendMode: config.sendMode,
       maxBatchSize: config.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE,
       flushIntervalMs: config.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
-      ...(config.maxQueueSize !== undefined ? { maxQueueSize: config.maxQueueSize } : {}),
+      maxQueueSize: config.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE,
       deliver: (batch) => this.deliverBatch(batch),
     });
     this.spanQueue = new SpanQueue({
       sendMode: config.sendMode,
       maxBatchSize: config.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE,
       flushIntervalMs: config.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
-      ...(config.maxQueueSize !== undefined ? { maxQueueSize: config.maxQueueSize } : {}),
+      maxQueueSize: config.maxQueueSize ?? DEFAULT_MAX_SPAN_QUEUE_SIZE,
       deliver: (batch) => this.deliverSpanBatch(batch),
     });
   }
 
   enqueueSpan(row: SdkSpanRow): void {
-    if (this.config.enabled === false) {
+    if (this.config.enabled === false || !isTelemetryActive()) {
       return;
     }
-    if (this.captureGate !== null && !this.captureGate.shouldCaptureSpan(row)) {
-      return;
+    try {
+      if (this.captureGate !== null && !this.captureGate.shouldCaptureSpan(row)) {
+        return;
+      }
+      this.spanQueue.enqueue(this.attachLegacySpanScope(this.withJsonSafeAttributes(row)));
+    } catch (err) {
+      reportInternalFailure('client.enqueueSpan', err);
     }
-    this.spanQueue.enqueue(this.attachLegacySpanScope(row));
   }
 
   enqueue(event: StackTraceEvent): void {
-    if (this.config.enabled === false) {
+    if (this.config.enabled === false || !isTelemetryActive()) {
       return;
     }
-    const next = this.config.beforeSend ? this.config.beforeSend(event) : event;
+    let next: StackTraceEvent | null;
+    try {
+      next = this.config.beforeSend ? this.config.beforeSend(event) : event;
+    } catch (err) {
+      // `beforeSend` costuma ser a redação de PII do cliente: se ela falhou, o evento NÃO sai.
+      reportInternalFailure('client.beforeSend', err);
+      return;
+    }
     if (next === null) {
       return;
     }
-    if (this.captureGate !== null && !this.captureGate.shouldCaptureStackTraceEvent(next)) {
-      return;
+    try {
+      if (this.captureGate !== null && !this.captureGate.shouldCaptureStackTraceEvent(next)) {
+        return;
+      }
+      this.queue.enqueue(this.attachCommonContext(next));
+    } catch (err) {
+      reportInternalFailure('client.enqueue', err);
     }
-    this.queue.enqueue(this.attachCommonContext(next));
   }
 
   /** Release string from `init({ release })`, if set. */
@@ -194,6 +214,14 @@ export class StackTraceClient {
     }
     const merged = { ...extra, ...event.context };
     return { ...event, context: merged } as StackTraceEvent;
+  }
+
+  /** `attributes` vêm do cliente e vão direto para `JSON.stringify({ spans })`, sem normalizador no meio. */
+  private withJsonSafeAttributes(row: SdkSpanRow): SdkSpanRow {
+    if (row.attributes === undefined || row.attributes === null) {
+      return row;
+    }
+    return { ...row, attributes: toJsonSafe(row.attributes) as Record<string, unknown> };
   }
 
   private attachLegacySpanScope(row: SdkSpanRow): SdkSpanRow {
@@ -284,7 +312,7 @@ export class StackTraceClient {
       }
       await this.sendDefaultIngest(batch);
     } catch (err: unknown) {
-      this.config.onTransportError?.(err);
+      this.notifyTransportError(err);
       // Re-throw so the queue knows delivery failed and keeps items for retry.
       throw err;
     }
@@ -299,18 +327,31 @@ export class StackTraceClient {
       }
       await this.sendDefaultSpans(batch);
     } catch (err: unknown) {
-      this.config.onTransportError?.(err);
+      this.notifyTransportError(err);
       throw err;
     }
   }
 
   private warnDroppedContextKey(key: string): void {
-    this.config.logger?.warn?.(
-      { key },
-      `cc-stacktracer: dropped context/attributes key "${key}" — its value is an object/array under ` +
-        'an unrecognized top-level key and was not sent. Known blocks: http, db, business, correlation, ' +
-        'queue, tags. See docs/client-installation-integration-playbook.md section 20.5.',
-    );
+    try {
+      this.config.logger?.warn?.(
+        { key },
+        `cc-stacktracer: dropped context/attributes key "${key}" — its value is an object/array under ` +
+          'an unrecognized top-level key and was not sent. Known blocks: http, db, business, correlation, ' +
+          'queue, tags. See docs/client-installation-integration-playbook.md section 20.5.',
+      );
+    } catch (err) {
+      reportInternalFailure('client.logger', err);
+    }
+  }
+
+  /** Um callback que lança não pode substituir o erro original: um 401 permanente viraria retry eterno. */
+  private notifyTransportError(err: unknown): void {
+    try {
+      this.config.onTransportError?.(err);
+    } catch (callbackErr) {
+      reportInternalFailure('client.onTransportError', callbackErr);
+    }
   }
 
   private async sendDefaultIngest(batch: StackTraceEvent[]): Promise<void> {

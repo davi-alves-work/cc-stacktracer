@@ -127,3 +127,40 @@ describe('EventQueue', () => {
     q.stop();
   });
 });
+
+describe('EventQueue fail-open', () => {
+  it('descarta o lote da frente após maxDeliveryAttempts falhas não permanentes, e a fila anda', async () => {
+    vi.useFakeTimers();
+    try {
+      const deliver = vi.fn().mockImplementation(async (batch: LogEvent[]) => {
+        if (batch[0]?.message === 'poison') throw new TypeError('Do not know how to serialize a BigInt');
+      });
+      const q = new EventQueue({
+        sendMode: 'batch',
+        maxBatchSize: 1,
+        flushIntervalMs: 60_000,
+        deliver,
+        maxDeliveryAttempts: 3,
+        retryBackoff: { random: () => 0.5, baseDelayMs: 10, maxDelayMs: 10 },
+      });
+
+      q.enqueue(logEvent('poison'));
+      q.enqueue(logEvent('good'));
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      const messages = deliver.mock.calls.map((call) => (call[0] as LogEvent[])[0]?.message);
+      expect(messages.filter((m) => m === 'poison')).toHaveLength(3);
+      expect(messages).toContain('good');
+      q.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('no modo immediate limita os envios simultâneos a 64', () => {
+    const deliver = vi.fn().mockReturnValue(new Promise<void>(() => {}));
+    const q = new EventQueue({ sendMode: 'immediate', maxBatchSize: 1, flushIntervalMs: 60_000, deliver });
+    for (let i = 0; i < 100; i += 1) q.enqueue(logEvent(`e${i}`));
+    expect(deliver).toHaveBeenCalledTimes(64);
+  });
+});

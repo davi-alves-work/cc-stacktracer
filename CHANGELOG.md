@@ -4,6 +4,59 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-09-23
+
+### Fixed
+
+- **A successful database write or HTTP call could be reported to the application as failed.** In
+  `runQuery` with `leaf: true` (the path of the Prisma extension) and in the instrumented `fetch`, span
+  emission ran inside the same `try` as the operation. If it threw after the query committed or the
+  server answered, the `catch` took the SDK's error for the operation's and rethrew it — a committed
+  `INSERT` or a `201` looked like a failure, and a retry duplicated it. `withSpan`, `withTrace` and
+  `measure` had the same shape. Telemetry now runs outside that `try`, the operation runs exactly once,
+  and its error is always rethrown as the same object.
+- **`init()` threw on an invalid configuration**, taking the application down at boot — a missing API
+  key, a non-UUID `serviceId`, `STACKTRACE_CAPTURE_POLICY_REFRESH_MS=60s`. It now prints one
+  `console.error` (field paths and messages, never values) and leaves the SDK off.
+- **The in-memory queues were unbounded.** With ingestion down they grew until the process ran out of
+  memory. Defaults are now 1,000 events and 10,000 spans.
+- **A batch that could never be sent blocked its queue forever.** A span attribute holding a `BigInt` or
+  a circular reference made `JSON.stringify` throw, and that batch was retried indefinitely at the head
+  of the queue. Span attributes are now made JSON-safe on enqueue, and a head batch is dropped after 10
+  failed attempts.
+- **A throwing `getHeaders` could crash the process** through an unhandled rejection in the capture
+  policy refresh — which also stopped refreshing for good.
+- **`enableGlobalHandlers` changed how the process dies.** It removed the host's listeners, called
+  `process.exit(1)` even when the host had its own handler, exited without printing the error, disabled
+  Node's default crash on unhandled rejections, and stacked a new set of listeners on every `init()`.
+- **Outbound `node:http` instrumentation changed the application's requests.** Headers passed in raw
+  array form were dropped (including `Authorization`); a response nobody listened to was no longer
+  discarded, holding its socket; an `'error'` with no application listener was swallowed instead of
+  thrown. `fetch(request, { headers })` merged the Request's headers instead of replacing them.
+- Express, Fastify, Adonis and generic HTTP: a failure in telemetry setup failed the request, and a
+  failure while emitting the root span escaped the `finish`/`close` listeners as an uncaught exception.
+  Knex/Lucid listeners could throw back into the query runner.
+- A throwing `beforeSend`, `onTransportError`, `onNotices` or `logger` no longer propagates. A throwing
+  `beforeSend` drops the event — it is usually your PII redaction, so the event is never sent unredacted.
+- `setUser({ email: null })` threw.
+
+### Added
+
+- **`STACKTRACE_DISABLED=1`** — kill switch: nothing is patched and every integration becomes a
+  pass-through. Distinct from `enabled: false`, which only stops sending.
+- **Self-disabling fuse**: 100 internal failures within 60 seconds turn telemetry off until restart, with
+  one `console.warn`.
+- Internal failures reach your `logger` (or the console with `debug: true`); silent otherwise.
+
+### Changed
+
+- `flush()` and `shutdown()` never reject and resolve within 5 seconds.
+- `sendMode: 'immediate'` delivers at most 64 events and 64 spans concurrently; beyond that they are
+  dropped.
+- `traceparent` on `node:http` is now set with `setHeader` on the created request instead of rewriting
+  your options. Requests whose headers are committed at creation (raw array headers,
+  `Expect: 100-continue`) are sent without `traceparent`.
+
 ## [2.5.0] - 2026-09-19
 
 ### Fixed

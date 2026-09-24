@@ -7,6 +7,7 @@ import { getTraceIdFromContext, runWithTraceContext } from './trace-span-context
 import { withBusinessContext, withBusinessContextAsync } from './business-context.js';
 import { endSpan, startSpan, withSpan, withTrace } from './tracing.js';
 import type { SdkSpanRow } from './span-payload.types.js';
+import { resetFailOpenState } from './safe-run.js';
 
 const serviceId = '11111111-1111-4111-8111-111111111111';
 
@@ -154,5 +155,111 @@ describe('withTrace', () => {
     expect(child?.parent_span_id).toBe(root?.span_id);
     expect(child?.trace_id).toBe(root?.trace_id);
     expect(child?.span_type).toBe('business');
+  });
+});
+
+describe('fail-open: a telemetria nunca muda o que a app vê', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    setSdkRuntime(null, null);
+    resetFailOpenState();
+  });
+
+  function throwingClient(): StackTraceClient {
+    const client = setupClient();
+    vi.spyOn(client, 'enqueueSpan').mockImplementation(() => {
+      throw new Error('telemetry boom');
+    });
+    return client;
+  }
+
+  it('withSpan devolve o resultado de um fn bem-sucedido mesmo se emitir o span lançar', async () => {
+    throwingClient();
+    const fn = vi.fn(async () => 'charged');
+    await runWithTraceContext('trace-fo-1', 'aaaaaaaaaaaaaaaa', async () => {
+      await expect(withSpan('billing.charge', fn)).resolves.toBe('charged');
+    });
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('withSpan relança o MESMO objeto de erro mesmo se emitir o span também lançar', async () => {
+    throwingClient();
+    const appError = new Error('card declined');
+    await runWithTraceContext('trace-fo-2', 'aaaaaaaaaaaaaaaa', async () => {
+      await expect(
+        withSpan('billing.charge', () => {
+          throw appError;
+        }),
+      ).rejects.toBe(appError);
+    });
+  });
+
+  it('withSpan mantém a cadeia de pais depois de uma emissão que falhou', async () => {
+    const client = setupClient();
+    const enqueue = vi.spyOn(client, 'enqueueSpan').mockImplementationOnce(() => {
+      throw new Error('telemetry boom');
+    });
+    await runWithTraceContext('trace-fo-3', 'aaaaaaaaaaaaaaaa', async () => {
+      await withSpan('first', async () => undefined);
+      await withSpan('second', async () => undefined);
+    });
+    const second = enqueue.mock.calls[1]?.[0] as SdkSpanRow;
+    expect(second.span_name).toBe('second');
+    expect(second.parent_span_id).toBe('aaaaaaaaaaaaaaaa');
+  });
+
+  it('withTrace devolve o resultado do job mesmo se emitir o span lançar', async () => {
+    throwingClient();
+    await expect(withTrace('job.sync', async () => 7)).resolves.toBe(7);
+  });
+
+  it('withTrace relança o erro do job pela identidade', async () => {
+    throwingClient();
+    const jobError = new Error('job failed');
+    await expect(
+      withTrace('job.sync', () => {
+        throw jobError;
+      }),
+    ).rejects.toBe(jobError);
+  });
+
+  it('startSpan().end nunca lança e é idempotente', async () => {
+    const client = throwingClient();
+    await runWithTraceContext('trace-fo-4', 'aaaaaaaaaaaaaaaa', () => {
+      const handle = startSpan('step');
+      expect(() => {
+        handle.end();
+        handle.end();
+      }).not.toThrow();
+    });
+    expect(client.enqueueSpan).toHaveBeenCalledTimes(1);
+  });
+
+  it('error.message que não é string não derruba o span nem troca o erro', async () => {
+    const client = setupClient();
+    const enqueue = vi.spyOn(client, 'enqueueSpan');
+    const weird = Object.assign(new Error(), { message: { code: 42 } as unknown as string });
+    await runWithTraceContext('trace-fo-5', 'aaaaaaaaaaaaaaaa', async () => {
+      await expect(
+        withSpan('x', () => {
+          throw weird;
+        }),
+      ).rejects.toBe(weird);
+    });
+    const row = enqueue.mock.calls[0]?.[0] as SdkSpanRow;
+    expect(row.status).toBe('error');
+    expect(row.error_message).toBeNull();
+  });
+
+  it('com STACKTRACE_DISABLED, withSpan só executa fn', async () => {
+    const client = setupClient();
+    const enqueue = vi.spyOn(client, 'enqueueSpan');
+    vi.stubEnv('STACKTRACE_DISABLED', '1');
+    resetFailOpenState();
+    await runWithTraceContext('trace-fo-6', 'aaaaaaaaaaaaaaaa', async () => {
+      await expect(withSpan('x', async () => 1)).resolves.toBe(1);
+    });
+    expect(enqueue).not.toHaveBeenCalled();
   });
 });

@@ -5,6 +5,7 @@ import { SCHEMA_VERSION, type LogEvent } from './stacktrace-event.types.js';
 import { StackTraceClient, type BatchTransportPayload } from './stacktrace-client.js';
 import type { SdkSpanRow } from './span-payload.types.js';
 import { IngestTransportError } from './transport/ingest-transport-error.js';
+import { resetFailOpenState } from './safe-run.js';
 
 const serviceId = '11111111-1111-4111-8111-111111111111';
 const testSvc = { name: 'svc', version: 'unknown', environment: 'prod' };
@@ -560,5 +561,135 @@ describe('StackTraceClient', () => {
     expect(events).toHaveLength(2);
     expect(events.find((e) => e.message === 'com trace')?.trace.trace_id).toBe('74655e3589e4205969440ccdc13a3b12');
     expect(events.find((e) => e.message === 'sem trace')?.trace.trace_id).toBe('00000000000000000000000000000000');
+  });
+});
+
+describe('StackTraceClient fail-open', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    resetFailOpenState();
+  });
+
+  function minimalSpan(): SdkSpanRow {
+    return {
+      span_timestamp: '2026-01-01T00:00:00.001Z',
+      trace_id: '0af7651916cd43dd8448eb211c80319c',
+      span_id: '00f067aa0ba902b7',
+      start_time: '2026-01-01T00:00:00.000Z',
+      end_time: '2026-01-01T00:00:00.001Z',
+      duration_us: 1000,
+      status: 'ok',
+    };
+  }
+
+  it('descarta o evento (nunca envia sem redação) quando beforeSend lança', async () => {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    const client = new StackTraceClient(
+      parseStackTraceInit({
+        apiKey: 'k',
+        serviceId,
+        service: 'svc',
+        environment: 'prod',
+        endpoint: 'https://ingest.example.com',
+        sendMode: 'immediate',
+        beforeSend: () => {
+          throw new Error('redaction bug');
+        },
+        transport,
+      }),
+    );
+    expect(() => client.enqueue(minimalLog('cpf 123'))).not.toThrow();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(transport).not.toHaveBeenCalled();
+    await client.shutdown();
+  });
+
+  it('enqueueSpan nunca lança quando a fila interna lança', async () => {
+    const client = new StackTraceClient(
+      parseStackTraceInit({
+        apiKey: 'k',
+        serviceId,
+        service: 'svc',
+        environment: 'prod',
+        endpoint: 'https://ingest.example.com',
+        sendMode: 'immediate',
+        transport: vi.fn().mockResolvedValue(undefined),
+      }),
+    );
+    const internals = client as unknown as { spanQueue: { enqueue: (row: SdkSpanRow) => void } };
+    vi.spyOn(internals.spanQueue, 'enqueue').mockImplementation(() => {
+      throw new Error('queue bug');
+    });
+    expect(() => client.enqueueSpan(minimalSpan())).not.toThrow();
+    await client.shutdown();
+  });
+
+  it('envia spans cujos attributes têm BigInt ou ciclo pelo transporte HTTP padrão', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new StackTraceClient(
+      parseStackTraceInit({
+        apiKey: 'k',
+        serviceId,
+        service: 'svc',
+        environment: 'prod',
+        endpoint: 'https://ingest.example.com',
+        sendMode: 'immediate',
+      }),
+    );
+    const cyclic: Record<string, unknown> = { a: 1 };
+    cyclic.self = cyclic;
+    client.enqueueSpan({ ...minimalSpan(), attributes: { order_id: 10n, cyclic } });
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const body = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string) as { spans: SdkSpanRow[] };
+    expect(body.spans[0]?.attributes).toEqual({ order_id: '10', cyclic: { a: 1, self: '[Circular]' } });
+    await client.shutdown();
+  });
+
+  it('erro permanente continua permanente quando onTransportError lança', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 401 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new StackTraceClient(
+      parseStackTraceInit({
+        apiKey: 'k',
+        serviceId,
+        service: 'svc',
+        environment: 'prod',
+        endpoint: 'https://ingest.example.com',
+        sendMode: 'batch',
+        maxBatchSize: 1,
+        onTransportError: () => {
+          throw new Error('callback bug');
+        },
+      }),
+    );
+    client.enqueue(minimalLog('x'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await client.shutdown();
+  });
+});
+
+describe('StackTraceClient fila limitada', () => {
+  it('limita a fila de eventos por padrão enquanto o ingest está fora', () => {
+    const client = new StackTraceClient(
+      parseStackTraceInit({
+        apiKey: 'k',
+        serviceId,
+        service: 'svc',
+        environment: 'prod',
+        endpoint: 'https://ingest.example.com',
+        transport: vi.fn().mockRejectedValue(new Error('ingest down')),
+      }),
+    );
+    for (let i = 0; i < 1_500; i += 1) client.enqueue(minimalLog(`e${i}`));
+    const internals = client as unknown as { queue: { queue: unknown[] } };
+    expect(internals.queue.queue.length).toBeLessThanOrEqual(1_000);
+    client.detachScheduling();
   });
 });

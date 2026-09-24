@@ -1,6 +1,7 @@
 import { extractSqlVerb } from '../performance/measure.js';
 import { beginOutboundSpan, endOutboundSpan, type OutboundSpanStart } from '../core/tracing.js';
 import type { StackTracePlugin } from '../core/plugins/types.js';
+import { safeRun } from '../core/safe-run.js';
 
 /**
  * Knex / Lucid connection that supports the `query`, `query-response` and `query-error` events.
@@ -35,6 +36,9 @@ type PendingQuerySpan = {
  * oldest entry is dropped and its span is never emitted.
  */
 export const MAX_PENDING_LUCID_QUERIES = 1000;
+
+/** Bulk insert pode ter megabytes de SQL; verbo e tabela estão sempre no começo do texto. */
+const MAX_SQL_SCAN_CHARS = 8_192;
 
 export type LucidStackTracePluginOptions = {
   /** Real database engine name, e.g. `postgres`, `mysql`, or `sqlserver`. */
@@ -94,28 +98,15 @@ export function createLucidStackTracePlugin(
     init() {
       const pending = new Map<string, PendingQuerySpan>();
 
-      const finish = (query: unknown, err?: Error): void => {
-        const uid = (query as KnexQueryEvent | null | undefined)?.__knexQueryUid;
-        if (typeof uid !== 'string') return;
-        const entry = pending.get(uid);
-        if (entry === undefined) return;
-        pending.delete(uid);
-        endOutboundSpan(entry.begin, {
-          name: entry.operationName,
-          type: 'db',
-          attributes: entry.attributes,
-          ...(err !== undefined ? { err } : {}),
-        });
-      };
-
-      database.on('query', (query: unknown) => {
+      const start = (query: unknown): void => {
         const q = query as KnexQueryEvent | null | undefined;
         const uid = q?.__knexQueryUid;
         if (q === null || q === undefined || typeof uid !== 'string' || uid === '') return;
         const begin = beginOutboundSpan();
         if (begin === null) return;
-        const verb = extractSqlVerb(q.sql) ?? (q.method !== undefined ? q.method.toUpperCase() : undefined);
-        const table = inferTable(q.sql, verb);
+        const sql = typeof q.sql === 'string' ? q.sql.slice(0, MAX_SQL_SCAN_CHARS) : undefined;
+        const verb = extractSqlVerb(sql) ?? (q.method !== undefined ? q.method.toUpperCase() : undefined);
+        const table = inferTable(sql, verb);
         const operationName = inferOperationName(verb, table);
         pending.set(uid, {
           begin,
@@ -130,14 +121,34 @@ export function createLucidStackTracePlugin(
           const oldest = pending.keys().next().value;
           if (oldest !== undefined) pending.delete(oldest);
         }
+      };
+
+      const finish = (query: unknown, err?: Error): void => {
+        const uid = (query as KnexQueryEvent | null | undefined)?.__knexQueryUid;
+        if (typeof uid !== 'string') return;
+        const entry = pending.get(uid);
+        if (entry === undefined) return;
+        pending.delete(uid);
+        endOutboundSpan(entry.begin, {
+          name: entry.operationName,
+          type: 'db',
+          attributes: entry.attributes,
+          ...(err !== undefined ? { err } : {}),
+        });
+      };
+
+      // O knex emite estes eventos de dentro do executor da query: um throw aqui voltaria para a query
+      // do cliente. Cada listener é dono da própria falha.
+      database.on('query', (query: unknown) => {
+        safeRun('lucid.query', () => start(query));
       });
 
       database.on('query-response', (_response: unknown, query: unknown) => {
-        finish(query);
+        safeRun('lucid.queryResponse', () => finish(query));
       });
 
       database.on('query-error', (error: unknown, query: unknown) => {
-        finish(query, error instanceof Error ? error : new Error(String(error)));
+        safeRun('lucid.queryError', () => finish(query, error instanceof Error ? error : new Error(String(error))));
       });
     },
   };

@@ -1,7 +1,14 @@
 import type { StackTraceEvent } from '../stacktrace-event.types.js';
+import { runDetached } from '../safe-run.js';
 import { chunkBatches } from './batch-sender.js';
 import { isPermanentIngestError } from './ingest-transport-error.js';
-import { nextQueueRetryDelayMs, resetQueueRetryTimer, type QueueRetryBackoffOptions } from './queue-retry-backoff.js';
+import {
+  DEFAULT_MAX_DELIVERY_ATTEMPTS,
+  MAX_IN_FLIGHT_IMMEDIATE,
+  nextQueueRetryDelayMs,
+  resetQueueRetryTimer,
+  type QueueRetryBackoffOptions,
+} from './queue-retry-backoff.js';
 
 export type EventQueueSendMode = 'batch' | 'immediate';
 
@@ -12,6 +19,8 @@ export type EventQueueOptions = {
   maxQueueSize?: number;
   deliver: (batch: StackTraceEvent[]) => Promise<void>;
   retryBackoff?: QueueRetryBackoffOptions;
+  /** Tentativas do lote da frente antes de descartá-lo. Default {@link DEFAULT_MAX_DELIVERY_ATTEMPTS}. */
+  maxDeliveryAttempts?: number;
 };
 
 /**
@@ -20,7 +29,8 @@ export type EventQueueOptions = {
  *
  * Reliability guarantees:
  * - Items are only removed from the queue after a successful delivery. A failed
- *   delivery leaves items in place so the next flush cycle retries them.
+ *   delivery leaves items in place so the next flush cycle retries them — up to
+ *   `maxDeliveryAttempts`, after which the head chunk is dropped so it cannot block the queue.
  * - An `isFlushing` guard prevents concurrent flush operations from interleaving
  *   and issuing duplicate HTTP requests during traffic bursts.
  */
@@ -33,12 +43,14 @@ export class EventQueue {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retryNotBefore = 0;
   private consecutiveFailures = 0;
+  private headAttempts = 0;
+  private inFlightImmediate = 0;
 
   constructor(private readonly options: EventQueueOptions) {}
 
   enqueue(event: StackTraceEvent): void {
     if (this.options.sendMode === 'immediate') {
-      void this.options.deliver([event]).catch(() => undefined);
+      this.deliverImmediately(event);
       return;
     }
 
@@ -48,7 +60,7 @@ export class EventQueue {
 
     this.queue.push(event);
     this.ensureInterval();
-    void this.runFlush(false);
+    runDetached('eventQueue.flush', () => this.runFlush(false));
   }
 
   /**
@@ -75,6 +87,22 @@ export class EventQueue {
     }
   }
 
+  private deliverImmediately(event: StackTraceEvent): void {
+    if (this.inFlightImmediate >= MAX_IN_FLIGHT_IMMEDIATE) {
+      return;
+    }
+    this.inFlightImmediate += 1;
+    runDetached('eventQueue.deliverImmediate', async () => {
+      try {
+        await this.options.deliver([event]);
+      } catch {
+        // falha de transporte, não do SDK: `onTransportError` já foi avisado dentro de `deliver`
+      } finally {
+        this.inFlightImmediate -= 1;
+      }
+    });
+  }
+
   private ensureInterval(): void {
     if (this.options.sendMode !== 'batch') {
       return;
@@ -83,7 +111,7 @@ export class EventQueue {
       return;
     }
     this.intervalHandle = setInterval(() => {
-      void this.runFlush(true);
+      runDetached('eventQueue.flush', () => this.runFlush(true));
     }, this.options.flushIntervalMs);
     this.intervalHandle.unref();
   }
@@ -132,8 +160,8 @@ export class EventQueue {
 
   /**
    * Delivers queued items chunk by chunk. Commits (splices) only the items that
-   * were successfully delivered; stops on the first failure so undelivered items
-   * remain in the queue for the next flush attempt.
+   * were successfully delivered — or dropped as permanent / exhausted — and stops on
+   * the first retryable failure so undelivered items remain for the next attempt.
    */
   private async deliverQueued(limit: number | undefined): Promise<number> {
     if (this.retryNotBefore > Date.now()) {
@@ -144,6 +172,7 @@ export class EventQueue {
 
     const minBatch = limit !== undefined ? 1 : this.options.maxBatchSize;
     const chunks = chunkBatches(this.queue.slice(0, count), this.options.maxBatchSize);
+    const maxAttempts = this.options.maxDeliveryAttempts ?? DEFAULT_MAX_DELIVERY_ATTEMPTS;
 
     let delivered = 0;
     for (const chunk of chunks) {
@@ -153,7 +182,9 @@ export class EventQueue {
         this.resetBackoff();
         delivered += chunk.length;
       } catch (err) {
-        if (isPermanentIngestError(err)) {
+        this.headAttempts += 1;
+        if (isPermanentIngestError(err) || this.headAttempts >= maxAttempts) {
+          this.headAttempts = 0;
           delivered += chunk.length;
           continue;
         }
@@ -170,6 +201,7 @@ export class EventQueue {
 
   private resetBackoff(): void {
     this.consecutiveFailures = 0;
+    this.headAttempts = 0;
     this.retryNotBefore = 0;
     this.retryTimer = resetQueueRetryTimer(this.retryTimer);
   }
@@ -185,7 +217,7 @@ export class EventQueue {
     this.retryTimer = resetQueueRetryTimer(this.retryTimer);
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
-      void this.runFlush(false);
+      runDetached('eventQueue.retry', () => this.runFlush(false));
     }, delayMs);
     this.retryTimer.unref?.();
   }
