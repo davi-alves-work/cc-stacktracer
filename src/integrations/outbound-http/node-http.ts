@@ -1,4 +1,4 @@
-import { createRequire } from 'node:module';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import type { ClientRequest, IncomingMessage } from 'node:http';
 import { isTelemetryActive, safeRun } from '../../core/safe-run.js';
 import { beginOutboundSpan, endOutboundSpan, type OutboundSpanStart } from '../../core/tracing.js';
@@ -160,7 +160,9 @@ function makeWrappedRequest(original: AnyRequest, isHttps: boolean, options: Out
  * method/status/timing. Covers libraries that bottom out at Node's http layer (axios on Node, got, etc.).
  *
  * Patches the CommonJS module objects via `createRequire`, so consumers using `require('http').request` /
- * `http.get` (incl. `follow-redirects`, used by axios) see the wrappers. Returns an uninstrument function.
+ * `http.get` (incl. `follow-redirects`, used by axios) see the wrappers, then syncs the builtin ESM exports
+ * so `import { request } from 'node:http'` sees them too. A function copied into a variable before this
+ * call (`const { request } = http`) keeps the original. Returns an uninstrument function.
  */
 export function instrumentNodeHttp(options: OutboundHttpOptions = {}): () => void {
   if (!isTelemetryActive()) {
@@ -195,10 +197,14 @@ export function instrumentNodeHttp(options: OutboundHttpOptions = {}): () => voi
       delete mod[INSTRUMENTED];
     });
   }
+  // Os named exports ESM de um builtin são uma cópia dos exports CJS: sem isto, `import { request }`
+  // continua com a função original e a chamada sai sem span nem traceparent.
+  syncBuiltinESMExports();
 
   return () => {
     for (const restore of restores) {
       restore();
     }
+    syncBuiltinESMExports();
   };
 }

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { getStackTraceClient, init, instrumentNodeHttp, shutdown } from '../../index.js';
 import { resetFailOpenState } from '../../core/safe-run.js';
@@ -110,6 +111,44 @@ describe('outbound node:http instrumentation', () => {
     expect(span.http_method).toBe('GET');
     expect(span.http_status_code).toBe(200);
     expect(received).toBe(`00-${traceId}-${span.span_id}-01`);
+  });
+
+  it('instrumenta quem importa request por nome no ESM (import { request } from "node:http")', async () => {
+    const transport = setup();
+    const port = await startServer();
+    restore = instrumentNodeHttp();
+    const esm = await import('node:http');
+
+    await runWithTraceContext(traceId, rootSpanId, async () => {
+      await new Promise<void>((resolve, reject) => {
+        const req = esm.request({ host: '127.0.0.1', port, path: '/webhook', method: 'POST' }, (res) => {
+          res.resume();
+          res.on('end', () => resolve());
+        });
+        req.on('error', reject);
+        req.end();
+      });
+    });
+
+    await vi.waitFor(() => expect(spans(transport).length).toBeGreaterThan(0));
+    const span = spans(transport)[0]!;
+    expect(span.http_method).toBe('POST');
+    expect(received).toBe(`00-${traceId}-${span.span_id}-01`);
+  });
+
+  it('os bindings ESM de http e https seguem o patch, e o uninstrument devolve os originais', async () => {
+    const require = createRequire(import.meta.url);
+    const before = { request: (await import('node:http')).request, get: (await import('node:https')).get };
+
+    restore = instrumentNodeHttp();
+    expect((await import('node:http')).get).toBe(require('node:http').get);
+    expect((await import('node:https')).request).toBe(require('node:https').request);
+    expect((await import('node:https')).get).toBe(require('node:https').get);
+
+    restore();
+    restore = () => {};
+    expect((await import('node:http')).request).toBe(before.request);
+    expect((await import('node:https')).get).toBe(before.get);
   });
 
   it('passes through without a span when there is no active trace context', async () => {

@@ -4,6 +4,17 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1] - 2026-09-24
+
+### Fixed
+
+- **`instrumentNodeHttp()` missed ESM named imports.** In an ES module, `import { request } from 'node:http'`
+  (or `get`, or the same from `node:https`) kept the unpatched function: the call went out without a span
+  and without `traceparent`, and nothing signalled it. The SDK now calls `module.syncBuiltinESMExports()`
+  after patching and after uninstrumenting, so named imports see the wrappers just like `http.request` and
+  `require('http').request` already did. A function copied into a variable before instrumentation
+  (`const { request } = http`) still keeps the original — call `init()`/`auto()` first.
+
 ## [2.6.0] - 2026-09-23
 
 ### Fixed
