@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resetFailOpenState } from '../core/safe-run.js';
-import { createStackTraceClient } from '../index.js';
+import { createStackTraceClient, init, shutdown } from '../index.js';
+import type { BatchTransportPayload } from '../core/stacktrace-client.js';
 import { stacktraceAdonisMiddleware, type AdonisHttpContextLike } from './adonis.js';
 
 const serviceId = '11111111-1111-4111-8111-111111111111';
@@ -266,9 +267,7 @@ describe('Adonis middleware fail-open', () => {
       },
     };
     const next = vi.fn().mockRejectedValue(weird);
-    await expect(
-      stacktraceAdonisMiddleware({ client: failOpenClient(), captureErrors: true })(ctxWith({}), next),
-    ).rejects.toBe(weird);
+    await expect(stacktraceAdonisMiddleware({ client: failOpenClient() })(ctxWith({}), next)).rejects.toBe(weird);
   });
 
   it('com STACKTRACE_DISABLED só chama next e não registra listeners', async () => {
@@ -279,5 +278,62 @@ describe('Adonis middleware fail-open', () => {
     await stacktraceAdonisMiddleware({ client: failOpenClient() })(ctxWith(handlers), next);
     expect(next).toHaveBeenCalledTimes(1);
     expect(Object.keys(handlers)).toEqual([]);
+  });
+});
+
+describe('Adonis Error Tracking (3.0)', () => {
+  afterEach(async () => {
+    await shutdown();
+  });
+
+  async function run(finalStatus: number): Promise<{ transport: ReturnType<typeof vi.fn> }> {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    init({
+      apiKey: 'k',
+      serviceId,
+      service: 'svc',
+      environment: 'test',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+    });
+    const handlers: Record<string, () => void> = {};
+    const raw = {
+      statusCode: 200,
+      on: (event: string, cb: () => void) => {
+        handlers[event] = cb;
+      },
+    };
+    const ctx: AdonisHttpContextLike = {
+      request: { method: () => 'GET', url: () => '/x', headers: () => ({}) },
+      response: { getResponse: () => raw },
+    };
+    const err = new Error('falhou');
+    await expect(stacktraceAdonisMiddleware()(ctx, () => Promise.reject(err))).rejects.toBe(err);
+    // O exception handler do Adonis decide o status depois que o erro sai do middleware.
+    raw.statusCode = finalStatus;
+    handlers.finish!();
+    return { transport };
+  }
+
+  const payloads = (transport: ReturnType<typeof vi.fn>): BatchTransportPayload[] =>
+    transport.mock.calls.map((c) => c[0] as BatchTransportPayload);
+
+  it('erro que vira 500: span raiz com erro e UM evento no span raiz', async () => {
+    const { transport } = await run(500);
+    await vi.waitFor(() => expect(payloads(transport).some((p) => p.kind === 'batch')).toBe(true));
+    const span = payloads(transport).find((p) => p.kind === 'spans')?.spans[0];
+    expect(span).toMatchObject({ status: 'error', error_type: 'Error', http_status_code: 500 });
+    const events = payloads(transport).flatMap((p) => (p.kind === 'batch' ? p.events : []));
+    expect(events).toHaveLength(1);
+    expect((events[0]?.context?.trace as { span_id?: string } | undefined)?.span_id).toBe(span?.span_id);
+  });
+
+  it('erro que vira 404: span raiz ok e nenhum evento', async () => {
+    const { transport } = await run(404);
+    await vi.waitFor(() => expect(payloads(transport).some((p) => p.kind === 'spans')).toBe(true));
+    const span = payloads(transport).find((p) => p.kind === 'spans')?.spans[0];
+    expect(span).toMatchObject({ status: 'ok', error_type: null, http_status_code: 404 });
+    expect(payloads(transport).some((p) => p.kind === 'batch')).toBe(false);
   });
 });

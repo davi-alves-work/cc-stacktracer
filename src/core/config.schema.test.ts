@@ -193,3 +193,24 @@ describe('parseStackTraceInit', () => {
     },
   );
 });
+
+describe('opcoes do Error Tracking', () => {
+  const base = { apiKey: 'k', serviceId, endpoint: 'https://ingest.example.com' };
+
+  it('aceita errorTracking e faixas validas', () => {
+    const parsed = parseStackTraceInit({
+      ...base,
+      errorTracking: false,
+      httpServerErrorStatuses: '500-599,429',
+      httpClientErrorStatuses: '400-599',
+    });
+    expect(parsed.errorTracking).toBe(false);
+    expect(parsed.httpServerErrorStatuses).toBe('500-599,429');
+    expect(parsed.httpClientErrorStatuses).toBe('400-599');
+  });
+
+  it('rejeita faixa invalida na opcao, com a dica do formato', () => {
+    expect(() => parseStackTraceInit({ ...base, httpServerErrorStatuses: '5xx' })).toThrow(/100 to 599/);
+    expect(() => parseStackTraceInit({ ...base, httpClientErrorStatuses: '500-' })).toThrow(/100 to 599/);
+  });
+});

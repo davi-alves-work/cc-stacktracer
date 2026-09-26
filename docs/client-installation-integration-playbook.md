@@ -396,12 +396,23 @@ await withTrace('job.reconcile-invoices', async () => {
 `withTrace` called from inside an already-active trace (e.g. a job triggered from within a
 request) delegates to `withSpan` and becomes a child span instead of opening a second trace.
 
-**`captureErrors` as an alternative to the manual error handler:** the Fastify and Adonis plugins
-accept `captureErrors: true` to capture the error that reaches the framework's error boundary
-automatically, already inside the request's trace context (Express has no such hook on the main
-middleware chain — register `stacktraceErrorMiddleware({ captureErrors: true })` after the routes
-instead). Default is `false` in all three: turning it on in an app whose own error handler already
-calls `captureException` would double-count every occurrence.
+**Errors are captured automatically (3.0, Error Tracking).** Every exception recorded on a span —
+a request that ends with a server error status, a `withTrace` job, a `withSpan`, a query, a network
+failure on an outbound call — becomes **one** error event per request or job: the one on the top-most
+span, already linked to the trace. No `captureException` needed. Following Datadog:
+
+- a request is an error only when its status is in `httpServerErrorStatuses` (default `"500-599"`, env
+  `STACKTRACE_HTTP_SERVER_ERROR_STATUSES`) — an exception that ends as a 404 is not an error;
+- an outbound call is an error when its status is in `httpClientErrorStatuses` (default `"500-599"`, env
+  `STACKTRACE_HTTP_CLIENT_ERROR_STATUSES`); a status-only error marks the span but is not an error
+  event, because there is no exception;
+- an error you catch and handle inside your own code is not captured — call `captureException` for
+  those. The same error object is never sent twice, so a `captureException` already in your error
+  handler does not double-count.
+
+Express has no error hook on the main chain: register `stacktraceErrorMiddleware()` after the routes so
+the exception is seen. To turn automatic capture off: `init({ errorTracking: false })` or
+`STACKTRACE_ERROR_TRACKING_ENABLED=false`.
 
 Full guide, including why the `events_untraced` check only becomes accurate as clients upgrade:
 [`docs/guides/correlate-logs-traces.md`](./guides/correlate-logs-traces.md).

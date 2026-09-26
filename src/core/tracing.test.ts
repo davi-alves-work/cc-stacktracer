@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setSdkRuntime } from './client-ref.js';
 import { parseStackTraceInit } from './config.schema.js';
 import { StackTraceClient } from './stacktrace-client.js';
 import { getTraceIdFromContext, runWithTraceContext } from './trace-span-context.js';
 import { withBusinessContext, withBusinessContextAsync } from './business-context.js';
-import { endSpan, startSpan, withSpan, withTrace } from './tracing.js';
+import { beginOutboundSpan, endOutboundSpan, endSpan, startSpan, withSpan, withTrace } from './tracing.js';
+import { resetErrorTrackingState } from './error-tracking.js';
 import type { SdkSpanRow } from './span-payload.types.js';
 import { resetFailOpenState } from './safe-run.js';
 
@@ -260,6 +261,100 @@ describe('fail-open: a telemetria nunca muda o que a app vê', () => {
     await runWithTraceContext('trace-fo-6', 'aaaaaaaaaaaaaaaa', async () => {
       await expect(withSpan('x', async () => 1)).resolves.toBe(1);
     });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+});
+
+describe('error tracking nos spans (3.0)', () => {
+  beforeEach(() => resetErrorTrackingState());
+  afterEach(() => {
+    setSdkRuntime(null, null);
+  });
+
+  type EventWithTrace = { message: string; context?: { trace?: { span_id?: string } } };
+  const eventsOf = (enqueue: { mock: { calls: unknown[][] } }): EventWithTrace[] =>
+    enqueue.mock.calls.map(([e]) => e as EventWithTrace);
+
+  it('job do signa-pro: o erro sobe SELECT -> getMany -> job e vira UM evento, no span do job', async () => {
+    const client = setupClient();
+    const enqueue = vi.spyOn(client, 'enqueue');
+    const enqueueSpan = vi.spyOn(client, 'enqueueSpan');
+    const err = new Error('S3 nao configurado');
+
+    await expect(
+      withTrace('job.expire-a3-signing-sessions', () =>
+        withSpan(
+          'globalSetting.getMany',
+          () =>
+            withSpan(
+              'Lucid.global_settings.select',
+              () => {
+                throw err;
+              },
+              { type: 'db' },
+            ),
+          { type: 'db' },
+        ),
+      ),
+    ).rejects.toBe(err);
+
+    const root = enqueueSpan.mock.calls.map(([r]) => r as SdkSpanRow).find((r) => r.parent_span_id === null);
+    expect(eventsOf(enqueue)).toHaveLength(1);
+    expect(eventsOf(enqueue)[0]).toMatchObject({
+      message: 'S3 nao configurado',
+      context: { trace: { span_id: root?.span_id } },
+    });
+  });
+
+  it('erro tratado dentro de um withSpan: o job termina bem e o erro sai no span que falhou', async () => {
+    const client = setupClient();
+    const enqueue = vi.spyOn(client, 'enqueue');
+    const enqueueSpan = vi.spyOn(client, 'enqueueSpan');
+
+    await withTrace('job.fallback', async () => {
+      try {
+        await withSpan('db.query', () => {
+          throw new Error('tabela faltando');
+        });
+      } catch {
+        // fallback do app
+      }
+    });
+
+    const failed = enqueueSpan.mock.calls.map(([r]) => r as SdkSpanRow).find((r) => r.span_name === 'db.query');
+    expect(eventsOf(enqueue)).toHaveLength(1);
+    expect(eventsOf(enqueue)[0]).toMatchObject({
+      message: 'tabela faltando',
+      context: { trace: { span_id: failed?.span_id } },
+    });
+  });
+
+  it('sucesso: nenhum evento', async () => {
+    const client = setupClient();
+    const enqueue = vi.spyOn(client, 'enqueue');
+    await withTrace('job.ok', () => withSpan('q', async () => 1));
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('erro por status numa chamada de saida marca o span, mas nao vira evento', async () => {
+    const client = setupClient();
+    const enqueue = vi.spyOn(client, 'enqueue');
+    const enqueueSpan = vi.spyOn(client, 'enqueueSpan');
+
+    await withTrace('job.calls-api', async () => {
+      const begin = beginOutboundSpan();
+      if (begin === null) throw new Error('sem trace');
+      endOutboundSpan(begin, {
+        name: 'GET api.example.com',
+        err: Object.assign(new Error('HTTP 503'), { name: 'HttpError' }),
+        errorFromStatus: true,
+      });
+    });
+
+    const outbound = enqueueSpan.mock.calls
+      .map(([r]) => r as SdkSpanRow)
+      .find((r) => r.span_name === 'GET api.example.com');
+    expect(outbound?.status).toBe('error');
     expect(enqueue).not.toHaveBeenCalled();
   });
 });

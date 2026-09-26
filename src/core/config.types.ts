@@ -64,6 +64,22 @@ export type StackTraceInitOptions = {
    */
   suppressServerNotices?: boolean;
   /**
+   * Error Tracking automatico (padrao `true`), no modelo do Datadog: toda excecao registrada num span —
+   * requisicao com erro de servidor, `withTrace`, `withSpan`, query, falha de rede — vira UM evento de erro
+   * por requisicao/job, o do span mais alto, sem `captureException`. Env: `STACKTRACE_ERROR_TRACKING_ENABLED`.
+   */
+  errorTracking?: boolean;
+  /**
+   * Status que tornam uma requisicao RECEBIDA um erro, no formato do Datadog: codigos ou faixas de 100 a 599
+   * separados por virgula. Padrao `"500-599"`. Env: `STACKTRACE_HTTP_SERVER_ERROR_STATUSES`.
+   */
+  httpServerErrorStatuses?: string;
+  /**
+   * Status que tornam uma chamada de SAIDA (`fetch`, `node:http`) um erro. Padrao `"500-599"` — o Datadog
+   * usa 400-499; aqui um 404 de API externa nao reprova a requisicao. Env: `STACKTRACE_HTTP_CLIENT_ERROR_STATUSES`.
+   */
+  httpClientErrorStatuses?: string;
+  /**
    * Optional legacy scope override. Modern ingestion resolves tenant/project from the API key
    * and does not require clients to configure these values.
    */

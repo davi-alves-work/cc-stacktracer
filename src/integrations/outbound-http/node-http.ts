@@ -1,3 +1,4 @@
+import { getErrorTrackingConfig } from '../../core/error-tracking-config.js';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import type { ClientRequest, IncomingMessage } from 'node:http';
 import { isTelemetryActive, safeRun } from '../../core/safe-run.js';
@@ -104,16 +105,18 @@ function observe(req: ClientRequest, plan: OutboundPlan, propagate: boolean): vo
   const finish = (status?: number, err?: Error): void => {
     if (finished) return;
     finished = true;
-    const errored =
-      err ??
-      (status !== undefined && status >= 500
+    // Falha de rede e excecao de verdade (Error Tracking); erro por status (faixa de cliente, padrao
+    // 500-599) so marca o span — sem excecao nao ha issue, como no Datadog.
+    const statusError =
+      err === undefined && status !== undefined && getErrorTrackingConfig().isClientErrorStatus(status)
         ? Object.assign(new Error(`HTTP ${status}`), { name: 'HttpError' })
-        : undefined);
+        : undefined;
+    const errored = err ?? statusError;
     endOutboundSpan(plan.begin, {
       name: plan.name,
       type: 'external',
       attributes: attributesFor(plan.url, plan.method, plan.begin, plan.classification, status),
-      ...(errored !== undefined ? { err: errored } : {}),
+      ...(errored !== undefined ? { err: errored, errorFromStatus: statusError !== undefined } : {}),
     });
   };
 

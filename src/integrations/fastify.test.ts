@@ -6,6 +6,7 @@ import { createStackTraceClient, init, shutdown } from '../index.js';
 import type { BatchTransportPayload } from '../core/stacktrace-client.js';
 import type { StackTraceEvent } from '../core/stacktrace-event.types.js';
 import stacktracePlugin from './fastify.js';
+import { resetRemovedOptionWarnings } from './removed-options.js';
 import { resetFailOpenState } from '../core/safe-run.js';
 import type { StackTraceClient } from '../core/stacktrace-client.js';
 
@@ -21,8 +22,7 @@ function sentEvents(transport: ReturnType<typeof vi.fn>): StackTraceEvent[] {
 
 describe('Fastify plugin', () => {
   afterEach(async () => {
-    // Some tests below drive `captureBoundaryError`'s default `captureException`, which reads the
-    // singleton set by `init()` — clear it so it never leaks into a later test in this file.
+    // Os testes de Error Tracking usam init(): limpar o singleton para nao vazar para o proximo.
     await shutdown();
   });
 
@@ -175,11 +175,7 @@ describe('Fastify plugin', () => {
     await app.close();
   });
 
-  it('captureErrors: true emite um evento de erro correlacionado ao trace_id do span raiz', async () => {
-    const transport = vi.fn().mockResolvedValue(undefined);
-    // `captureBoundaryError`'s default capture is `captureException`, which reads the singleton —
-    // not the `client` override used elsewhere in this file for span assertions — so this case
-    // goes through `init()` to exercise the real wiring end to end.
+  function initWith(transport: ReturnType<typeof vi.fn>): void {
     init({
       apiKey: 'k',
       serviceId,
@@ -189,9 +185,13 @@ describe('Fastify plugin', () => {
       sendMode: 'immediate',
       transport,
     });
+  }
 
+  it('erro 500 lancado: span raiz com erro e UM evento, ligado ao span raiz (3.0, sem opcao)', async () => {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    initWith(transport);
     const app = Fastify();
-    await app.register(stacktracePlugin, { captureErrors: true });
+    await app.register(stacktracePlugin);
     app.get('/boom', async () => {
       throw new Error('boom');
     });
@@ -203,45 +203,51 @@ describe('Fastify plugin', () => {
       expect(sentPayloads(transport).some((item) => item.kind === 'spans')).toBe(true);
       expect(sentPayloads(transport).some((item) => item.kind === 'batch')).toBe(true);
     });
-
     const span = sentPayloads(transport).find((item) => item.kind === 'spans')?.spans[0];
-    const errorEvent = sentEvents(transport).find((event) => event.type === 'error');
-    expect(errorEvent?.message).toBe('boom');
-    // Ancora a asserção seguinte num trace_id real — sem isso, dois `undefined` bateriam igual e
-    // mascarariam justamente a regressão de perda de contexto de trace que este teste existe para pegar.
-    expect(span?.trace_id).toMatch(/^[0-9a-f]{32}$/);
-    const trace = errorEvent?.context?.trace as { trace_id?: string } | undefined;
-    expect(trace?.trace_id).toBe(span?.trace_id);
-
+    expect(span).toMatchObject({ status: 'error', error_type: 'Error', error_message: 'boom' });
+    const errors = sentEvents(transport).filter((event) => event.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.message).toBe('boom');
+    // Ancora num span_id real: dois undefined bateriam igual e esconderiam a perda de contexto.
+    expect(span?.span_id).toMatch(/^[0-9a-f]{16}$/);
+    const trace = errors[0]?.context?.trace as { trace_id?: string; span_id?: string } | undefined;
+    expect(trace).toMatchObject({ trace_id: span?.trace_id, span_id: span?.span_id });
     await app.close();
   });
 
-  it('sem captureErrors (opção ausente) nenhum evento de erro é enfileirado', async () => {
+  it('erro lancado que vira 404: span raiz ok e nenhum evento (como o Datadog)', async () => {
     const transport = vi.fn().mockResolvedValue(undefined);
-    init({
-      apiKey: 'k',
-      serviceId,
-      service: 'svc',
-      environment: 'test',
-      endpoint: 'https://ingest.example.com',
-      sendMode: 'immediate',
-      transport,
-    });
-
+    initWith(transport);
     const app = Fastify();
     await app.register(stacktracePlugin);
-    app.get('/boom', async () => {
-      throw new Error('boom');
+    app.get('/missing', async () => {
+      throw Object.assign(new Error('nao existe'), { statusCode: 404 });
     });
 
-    const res = await app.inject({ method: 'GET', url: '/boom' });
-    expect(res.statusCode).toBe(500);
+    const res = await app.inject({ method: 'GET', url: '/missing' });
+    expect(res.statusCode).toBe(404);
 
     await vi.waitFor(() => expect(sentPayloads(transport).some((item) => item.kind === 'spans')).toBe(true));
-
+    const span = sentPayloads(transport).find((item) => item.kind === 'spans')?.spans[0];
+    expect(span).toMatchObject({ status: 'ok', error_type: null, http_status_code: 404 });
     expect(sentPayloads(transport).some((item) => item.kind === 'batch')).toBe(false);
-
     await app.close();
+  });
+
+  it('captureErrors foi removido: aviso unico e a captura automatica segue igual', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    resetRemovedOptionWarnings();
+    const transport = vi.fn().mockResolvedValue(undefined);
+    initWith(transport);
+    const app = Fastify();
+    await app.register(stacktracePlugin, { captureErrors: true } as never);
+    const other = Fastify();
+    await other.register(stacktracePlugin, { captureErrors: false } as never);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('captureErrors was removed');
+    await app.close();
+    await other.close();
+    warn.mockRestore();
   });
 });
 

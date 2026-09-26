@@ -6,11 +6,13 @@ import {
   currentParentSpanIdForChild,
   currentTraceContext,
   getTraceIdFromContext,
+  getTraceSpanState,
   popActiveSpan,
   pushActiveSpan,
   runWithTraceContext,
 } from './trace-span-context.js';
 import { getBusinessContext } from './business-context.js';
+import { completeLocalRoot, recordSpanError } from './error-tracking.js';
 
 export type SpanOptions = {
   type?: 'http' | 'db' | 'business' | 'service' | 'external';
@@ -80,6 +82,16 @@ function asError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
 
+/**
+ * Distancia ate a raiz local: 0 na raiz, 1 no filho direto. O span de saida nao entra na pilha (e folha),
+ * entao fica logo abaixo do span em execucao.
+ */
+function spanDepth(spanId: string): number {
+  const stack = getTraceSpanState()?.spanStack ?? [];
+  const index = stack.indexOf(spanId);
+  return index === -1 ? stack.length : index;
+}
+
 function buildRow(params: {
   name: string;
   spanId: string;
@@ -91,6 +103,11 @@ function buildRow(params: {
   traceId?: string;
   options?: SpanOptions;
   err?: Error;
+  /**
+   * `false` para erro que so existe por status (o `HttpError` sintetico da chamada de saida): o span fica
+   * com erro, mas nao ha excecao de verdade para o Error Tracking — sem stack nao ha issue, como no Datadog.
+   */
+  trackError?: boolean;
 }): SdkSpanRow | null {
   const { client, initConfig } = getSdkRuntime();
   if (!client || !initConfig) {
@@ -108,6 +125,16 @@ function buildRow(params: {
   const dbDurAttr =
     numAttr(attrs, 'db_duration_us') ?? (dbDurMsAttr !== undefined ? Math.round(dbDurMsAttr * 1000) : undefined);
   const db_duration_us = spanType === 'db' ? (dbDurAttr ?? roundedDurationUs) : (dbDurAttr ?? null);
+
+  if (params.err !== undefined && params.trackError !== false) {
+    recordSpanError({
+      traceId,
+      spanId: params.spanId,
+      parentSpanId: params.parentSpanId,
+      depth: spanDepth(params.spanId),
+      error: params.err,
+    });
+  }
 
   return {
     span_timestamp: params.endIso,
@@ -250,9 +277,12 @@ export async function withTrace<T>(name: string, fn: () => Promise<T> | T, optio
       out = await fn();
     } catch (err) {
       safeRun('withTrace.end', () => finishRootSpan(root, name, asError(err)));
+      completeLocalRoot({ traceId: root.traceId, rootSpanId: root.spanId });
       throw err;
     }
     safeRun('withTrace.end', () => finishRootSpan(root, name));
+    // Mesmo com o job bem-sucedido: um erro tratado la dentro (fallback) ainda e o erro desta raiz.
+    completeLocalRoot({ traceId: root.traceId, rootSpanId: root.spanId });
     return out;
   });
 }
@@ -319,7 +349,14 @@ export function beginOutboundSpan(): OutboundSpanStart | null {
 /** Finalizes and enqueues an outbound client span. Callers must guard against double-finalization. */
 export function endOutboundSpan(
   begin: OutboundSpanStart,
-  params: { name: string; type?: SpanOptions['type']; attributes?: Record<string, unknown>; err?: Error },
+  params: {
+    name: string;
+    type?: SpanOptions['type'];
+    attributes?: Record<string, unknown>;
+    err?: Error;
+    /** O `err` so representa o status da resposta — marca o span, mas fica fora do Error Tracking. */
+    errorFromStatus?: boolean;
+  },
 ): void {
   safeRun('endOutboundSpan', () => {
     const options: SpanOptions = {
@@ -336,6 +373,7 @@ export function endOutboundSpan(
       durationUs: (performance.now() - begin.perfStart) * 1000,
       options,
       ...(params.err !== undefined ? { err: params.err } : {}),
+      trackError: params.errorFromStatus !== true,
     });
     if (row !== null) {
       getSdkRuntime().client?.enqueueSpan(row);

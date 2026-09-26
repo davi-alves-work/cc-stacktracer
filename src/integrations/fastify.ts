@@ -13,9 +13,10 @@ import { headersToRecord } from '../utils/headers.js';
 import { redactUrl } from '../utils/redact-url.js';
 import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { httpRootSpanOutcome } from './http-root-span-outcome.js';
-import { captureBoundaryError, type BoundaryCaptureOptions } from './capture-boundary-error.js';
+import { completeLocalRoot, recordBoundaryError } from '../core/error-tracking.js';
+import { warnRemovedCaptureErrors } from './removed-options.js';
 
-export type StacktracePluginOptions = BoundaryCaptureOptions & {
+export type StacktracePluginOptions = {
   /** Override for tests; defaults to singleton from init(). */
   client?: StackTraceClient | null;
 };
@@ -49,13 +50,22 @@ function emitRootSpan(
   client: StackTraceClient | null,
   aborted: boolean,
 ): void {
-  if (client === null) return;
-
   const req = request as TracedRequest;
   if (req[EMITTED_KEY] === true) return;
 
   const ctx = req[TRACE_CTX_KEY];
   if (ctx === undefined) return;
+
+  // Fecha a raiz do Error Tracking antes de qualquer corte (cliente ausente, politica de captura): o evento
+  // de erro tem politica propria no cliente. Chamada repetida (onSend e depois close) nao emite de novo.
+  const { boundaryError } = completeLocalRoot({
+    traceId: ctx.traceId,
+    rootSpanId: ctx.rootSpanId,
+    remoteParentSpanId: ctx.parentSpanId,
+    statusCode: reply.statusCode,
+  });
+
+  if (client === null) return;
 
   const snap = getRequestSnapshot();
   if (snap !== undefined) {
@@ -100,7 +110,7 @@ function emitRootSpan(
     start_time: startIso,
     end_time: endIso,
     duration_us: Math.max(0, Math.round(durationMs * 1000)),
-    ...httpRootSpanOutcome(aborted, reply.statusCode),
+    ...httpRootSpanOutcome(aborted, reply.statusCode, boundaryError),
     http_method: request.method,
     http_route: httpRoute.slice(0, 4096),
   });
@@ -140,6 +150,7 @@ async function stacktracePluginImpl(
   opts: StacktracePluginOptions | undefined,
 ): Promise<void> {
   const getClient = (): StackTraceClient | null => getOptionsClient(opts);
+  warnRemovedCaptureErrors(opts, 'the Fastify plugin');
 
   fastify.addHook('onRequest', (request, reply, next) => {
     const telemetry = isTelemetryActive()
@@ -169,8 +180,9 @@ async function stacktracePluginImpl(
       if (snap !== undefined) {
         snap.statusCode = reply.statusCode;
       }
-      // Depois de fixar o status: o evento carrega o `response_status_code` da resposta que falhou.
-      captureBoundaryError(error, opts);
+      // Candidata do Error Tracking. So vira evento se a resposta sair com status de erro de servidor —
+      // decidido no fim, quando o status e definitivo (como o `addStatusError` do Datadog).
+      recordBoundaryError(error);
     });
     done();
   });

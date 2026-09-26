@@ -5,6 +5,7 @@ import { StackTraceClient } from './core/stacktrace-client.js';
 import { runWithTraceContext } from './core/trace-span-context.js';
 import { getStackTraceClient, StackTrace, shutdown } from './index.js';
 import { resetFailOpenState } from './core/safe-run.js';
+import { markErrorCaptured } from './core/error-tracking.js';
 
 const serviceId = '11111111-1111-4111-8111-111111111111';
 
@@ -219,5 +220,40 @@ describe('init é fail-open', () => {
       expect.objectContaining({ label: 'log', error: 'telemetry boom' }),
       expect.stringContaining('internal failure'),
     );
+  });
+});
+
+describe('captureException nao duplica erro ja enviado (3.0)', () => {
+  afterEach(async () => {
+    await shutdown();
+  });
+
+  function initWithSpy() {
+    StackTrace.init({
+      apiKey: 'k',
+      serviceId,
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'batch',
+      transport: vi.fn().mockResolvedValue(undefined),
+    });
+    const client = getStackTraceClient();
+    if (client === null) throw new Error('init falhou');
+    return vi.spyOn(client, 'enqueue');
+  }
+
+  it('o mesmo objeto de erro capturado duas vezes vira um evento', () => {
+    const enqueue = initWithSpy();
+    const err = new Error('uma vez');
+    StackTrace.captureException(err);
+    StackTrace.captureException(err);
+    expect(enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('erro ja enviado pelo Error Tracking nao e reenviado por captureException', () => {
+    const enqueue = initWithSpy();
+    const err = new Error('ja foi');
+    markErrorCaptured(err);
+    StackTrace.captureException(err);
+    expect(enqueue).not.toHaveBeenCalled();
   });
 });

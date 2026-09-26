@@ -5,6 +5,8 @@ import { resetFailOpenState, safeRun, safeRunAsync, setInternalFailureSink } fro
 import { parseStackTraceInit, type ParsedStackTraceInit } from './core/config.schema.js';
 import { buildInternalFailureSink, reportInvalidConfig } from './core/init-diagnostics.js';
 import { isSdkDisabledByEnv } from './core/kill-switch.js';
+import { resolveErrorTrackingConfig } from './core/error-tracking-config.js';
+import { isErrorCaptured, markErrorCaptured } from './core/error-tracking.js';
 import type { StackTraceAutoOptions, StackTraceInitOptions } from './core/config.types.js';
 import type { StackTracePlugin } from './core/plugins/types.js';
 import {
@@ -93,22 +95,18 @@ function startClient(parsed: ParsedStackTraceInit): void {
     endpoint: parsed.endpoint,
     ...(parsed.tenantId !== undefined ? { tenantId: parsed.tenantId } : {}),
     ...(parsed.projectId !== undefined ? { projectId: parsed.projectId } : {}),
+    errorTracking: resolveErrorTrackingConfig({
+      errorTracking: parsed.errorTracking,
+      httpServerErrorStatuses: parsed.httpServerErrorStatuses,
+      httpClientErrorStatuses: parsed.httpClientErrorStatuses,
+      env: process.env,
+      warn: (message) => (parsed.logger?.warn !== undefined ? parsed.logger.warn({}, message) : console.warn(message)),
+    }),
   });
   setInternalFailureSink(buildInternalFailureSink(parsed));
   if (parsed.enableGlobalHandlers) {
     registerGlobalHandlers({
-      captureException: (err) => {
-        const { client, initConfig } = getSdkRuntime();
-        if (client && initConfig) {
-          client.enqueue(
-            buildErrorEvent({
-              service: initConfig.service,
-              environment: initConfig.environment,
-              error: err,
-            }),
-          );
-        }
-      },
+      captureException: (err) => enqueueErrorOnce(err),
       flush: () => {
         const { client } = getSdkRuntime();
         return client ? client.flush() : Promise.resolve();
@@ -117,19 +115,27 @@ function startClient(parsed: ParsedStackTraceInit): void {
   }
 }
 
+/**
+ * Um objeto de erro vira no maximo UM evento, venha de onde vier: `captureException` manual, o Error
+ * Tracking automatico ou o handler global. Quem ja chamava `captureException` no error handler e relancava
+ * nao passa a contar em dobro com a captura automatica da 3.0.
+ */
+function enqueueErrorOnce(error: Error, context?: Record<string, unknown>): void {
+  const { client, initConfig } = getSdkRuntime();
+  if (!client || !initConfig || isErrorCaptured(error)) return;
+  markErrorCaptured(error);
+  client.enqueue(
+    buildErrorEvent({
+      service: initConfig.service,
+      environment: initConfig.environment,
+      error,
+      ...(context !== undefined ? { context } : {}),
+    }),
+  );
+}
+
 export function captureException(error: Error, context?: Record<string, unknown>): void {
-  safeRun('captureException', () => {
-    const { client, initConfig } = getSdkRuntime();
-    if (!client || !initConfig) return;
-    client.enqueue(
-      buildErrorEvent({
-        service: initConfig.service,
-        environment: initConfig.environment,
-        error,
-        ...(context !== undefined ? { context } : {}),
-      }),
-    );
-  });
+  safeRun('captureException', () => enqueueErrorOnce(error, context));
 }
 
 export function log(message: string, metadata?: Record<string, unknown>): void {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getStackTraceClient, init, instrumentFetch, shutdown } from '../../index.js';
 import { resetFailOpenState } from '../../core/safe-run.js';
 import { runWithTraceContext } from '../../core/trace-span-context.js';
+import { withTrace } from '../../core/tracing.js';
 import type { BatchTransportPayload } from '../../core/stacktrace-client.js';
 import type { SdkSpanRow } from '../../core/span-payload.types.js';
 
@@ -117,6 +118,82 @@ describe('outbound fetch instrumentation', () => {
     expect(span.status).toBe('error');
     expect(span.http_status_code).toBe(503);
     expect(span.attributes?.['peer.kind']).toBe('external_api');
+  });
+
+  it('3.0: erro por status (503) marca o span, mas nao vira evento — sem excecao nao ha issue', async () => {
+    const transport = setup();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('boom', { status: 503 })),
+    );
+    restore = instrumentFetch();
+    await withTrace('job.sync', async () => {
+      await fetch('https://api.example.com/sync');
+    });
+    await vi.waitFor(() => expect(spans(transport).some((s) => s.span_type === 'external')).toBe(true));
+    const span = spans(transport).find((s) => s.span_type === 'external')!;
+    expect(span).toMatchObject({ status: 'error', error_type: 'HttpError', http_status_code: 503 });
+    expect(transport.mock.calls.some((c) => (c[0] as BatchTransportPayload).kind === 'batch')).toBe(false);
+  });
+
+  it('3.0: 404 de API externa nao e erro por padrao', async () => {
+    const transport = setup();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('nope', { status: 404 })),
+    );
+    restore = instrumentFetch();
+    await withTrace('job.lookup', async () => {
+      await fetch('https://api.example.com/items/1');
+    });
+    await vi.waitFor(() => expect(spans(transport).some((s) => s.span_type === 'external')).toBe(true));
+    expect(spans(transport).find((s) => s.span_type === 'external')?.status).toBe('ok');
+  });
+
+  it('3.0: httpClientErrorStatuses=400-599 faz o 404 contar como erro', async () => {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    init({
+      apiKey: 'k',
+      serviceId,
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+      httpClientErrorStatuses: '400-599',
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('nope', { status: 404 })),
+    );
+    restore = instrumentFetch();
+    await withTrace('job.lookup', async () => {
+      await fetch('https://api.example.com/items/1');
+    });
+    await vi.waitFor(() => expect(spans(transport).some((s) => s.span_type === 'external')).toBe(true));
+    expect(spans(transport).find((s) => s.span_type === 'external')?.status).toBe('error');
+  });
+
+  it('3.0: falha de rede e excecao de verdade: vira UM evento, no span de saida', async () => {
+    const transport = setup();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('fetch failed');
+      }),
+    );
+    restore = instrumentFetch();
+    await withTrace('job.sync', async () => {
+      await fetch('https://api.example.com/sync').catch(() => undefined);
+    });
+    await vi.waitFor(() =>
+      expect(transport.mock.calls.some((c) => (c[0] as BatchTransportPayload).kind === 'batch')).toBe(true),
+    );
+    const external = spans(transport).find((s) => s.span_type === 'external')!;
+    const events = transport.mock.calls.flatMap((c) => {
+      const p = c[0] as BatchTransportPayload;
+      return p.kind === 'batch' ? p.events : [];
+    });
+    expect(events.map((e) => e.message)).toEqual(['fetch failed']);
+    expect((events[0]?.context?.trace as { span_id?: string } | undefined)?.span_id).toBe(external.span_id);
   });
 
   it('does not double-wrap when instrumentFetch is called twice', async () => {

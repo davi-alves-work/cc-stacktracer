@@ -1,3 +1,4 @@
+import type { ErrorTrackingConfig } from './error-tracking-config.js';
 import type { StackTraceClient } from './stacktrace-client.js';
 import type { ServiceDescriptor } from './stacktrace-event.types.js';
 
@@ -8,6 +9,8 @@ export type SdkInitConfig = {
   endpoint: string;
   tenantId?: string;
   projectId?: string;
+  /** Resolvida no `init` (opcao > env > padrao). Ausente = padrao. */
+  errorTracking?: ErrorTrackingConfig;
 };
 
 let client: StackTraceClient | null = null;

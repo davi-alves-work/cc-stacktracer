@@ -10,9 +10,10 @@ import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { redactHeaders } from '../utils/redact-headers.js';
 import { redactUrl } from '../utils/redact-url.js';
 import { httpRootSpanOutcome } from './http-root-span-outcome.js';
-import { captureBoundaryError, type BoundaryCaptureOptions } from './capture-boundary-error.js';
+import { completeLocalRoot, recordBoundaryError } from '../core/error-tracking.js';
+import { warnRemovedCaptureErrors } from './removed-options.js';
 
-export type StacktraceAdonisOptions = BoundaryCaptureOptions & {
+export type StacktraceAdonisOptions = {
   /** Override for tests; defaults to singleton from init(). */
   client?: StackTraceClient | null;
   /**
@@ -77,9 +78,17 @@ function prepareRequest(ctx: AdonisHttpContextLike, opts: StacktraceAdonisOption
   const emit = (aborted: boolean): void => {
     if (emitted) return;
     emitted = true;
+    const statusCode = raw.statusCode ?? 200;
+    // O exception handler do Adonis ja decidiu o status. Fecha a raiz do Error Tracking antes de qualquer
+    // corte (cliente ausente, politica de captura, emitHttpRootSpan: false) — o evento tem politica propria.
+    const { boundaryError } = completeLocalRoot({
+      traceId,
+      rootSpanId,
+      remoteParentSpanId: correlation.parentSpanId,
+      statusCode,
+    });
     if (!client) return;
     const durationMs = Date.now() - start;
-    const statusCode = raw.statusCode ?? 200;
     snapshot.statusCode = statusCode;
     const pathOnly = url.split('?')[0] ?? url;
     const routePattern = ctx.route?.pattern;
@@ -110,7 +119,7 @@ function prepareRequest(ctx: AdonisHttpContextLike, opts: StacktraceAdonisOption
       start_time: startIso,
       end_time: endIso,
       duration_us: Math.max(0, Math.round(durationMs * 1000)),
-      ...httpRootSpanOutcome(aborted, statusCode),
+      ...httpRootSpanOutcome(aborted, statusCode, boundaryError),
       http_method: method,
       http_route: httpRoute.slice(0, 4096),
     });
@@ -137,6 +146,7 @@ function prepareRequest(ctx: AdonisHttpContextLike, opts: StacktraceAdonisOption
 export function stacktraceAdonisMiddleware(
   opts?: StacktraceAdonisOptions,
 ): (ctx: AdonisHttpContextLike, next: () => Promise<void>) => Promise<void> {
+  warnRemovedCaptureErrors(opts, 'stacktraceAdonisMiddleware');
   return async (ctx: AdonisHttpContextLike, next: () => Promise<void>) => {
     const telemetry = isTelemetryActive() ? safeRun('adonis.setup', () => prepareRequest(ctx, opts)) : undefined;
     if (telemetry === undefined) {
@@ -158,7 +168,7 @@ export function stacktraceAdonisMiddleware(
           try {
             await next();
           } catch (err) {
-            safeRun('adonis.captureError', () => captureBoundaryError(err, opts));
+            safeRun('adonis.recordError', () => recordBoundaryError(err));
             throw err;
           }
           if (!listening) {

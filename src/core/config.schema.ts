@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import type { StackTraceInitOptions } from './config.types.js';
 import { normalizeCapturePolicyRefreshMs, CAPTURE_POLICY_REFRESH_ENV } from './capture-policy-refresh-config.js';
+import { HTTP_STATUS_RANGES_HINT, isValidHttpErrorStatuses } from './http-error-statuses.js';
+
+function httpErrorStatusesSchema(option: string) {
+  return z.string().refine(isValidHttpErrorStatuses, { message: `${option}: use ${HTTP_STATUS_RANGES_HINT}` });
+}
 
 const sendModeSchema = z.enum(['batch', 'immediate']);
 
@@ -89,6 +94,9 @@ export const stackTraceInitSchema = z
     /** Sem default: `undefined` e `false` significam a mesma coisa aqui, e um default explicito
      *  so criaria uma terceira forma de dizer 'nao silencie'. */
     suppressServerNotices: z.boolean().optional(),
+    errorTracking: z.boolean().optional(),
+    httpServerErrorStatuses: httpErrorStatusesSchema('httpServerErrorStatuses').optional(),
+    httpClientErrorStatuses: httpErrorStatusesSchema('httpClientErrorStatuses').optional(),
     tenantId: z.string().uuid().optional(),
     projectId: z.string().uuid().optional(),
   })

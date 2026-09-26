@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { getStackTraceClient, init, instrumentNodeHttp, shutdown } from '../../index.js';
 import { resetFailOpenState } from '../../core/safe-run.js';
 import { runWithTraceContext } from '../../core/trace-span-context.js';
+import { withTrace } from '../../core/tracing.js';
 import type { BatchTransportPayload } from '../../core/stacktrace-client.js';
 import type { SdkSpanRow } from '../../core/span-payload.types.js';
 
@@ -149,6 +150,28 @@ describe('outbound node:http instrumentation', () => {
     restore = () => {};
     expect((await import('node:http')).request).toBe(before.request);
     expect((await import('node:https')).get).toBe(before.get);
+  });
+
+  it('3.0: resposta 503 marca o span, mas nao vira evento', async () => {
+    const transport = setup();
+    const port = await startServer(503);
+    restore = instrumentNodeHttp();
+    await withTrace('job.call', async () => {
+      await new Promise<void>((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port, path: '/x' }, (res) => {
+          res.resume();
+          res.on('end', () => resolve());
+        });
+        req.on('error', reject);
+        req.end();
+      });
+    });
+    await vi.waitFor(() => expect(spans(transport).some((s) => s.span_type === 'external')).toBe(true));
+    expect(spans(transport).find((s) => s.span_type === 'external')).toMatchObject({
+      status: 'error',
+      error_type: 'HttpError',
+    });
+    expect(transport.mock.calls.some((c) => (c[0] as BatchTransportPayload).kind === 'batch')).toBe(false);
   });
 
   it('passes through without a span when there is no active trace context', async () => {

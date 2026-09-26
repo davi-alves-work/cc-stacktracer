@@ -1,3 +1,4 @@
+import { getErrorTrackingConfig } from '../../core/error-tracking-config.js';
 import { isTelemetryActive, safeRun } from '../../core/safe-run.js';
 import { beginOutboundSpan, endOutboundSpan, type OutboundSpanStart } from '../../core/tracing.js';
 import { buildTraceparent } from '../../utils/traceparent.js';
@@ -130,13 +131,16 @@ export function instrumentFetch(options: OutboundHttpOptions = {}): () => void {
       throw rawErr;
     }
     safeRun('fetch.end', () => {
-      const err =
-        response.status >= 500 ? Object.assign(new Error(`HTTP ${response.status}`), { name: 'HttpError' }) : undefined;
+      // Status de erro pela faixa de cliente (padrao 500-599, httpClientErrorStatuses). O HttpError e so o
+      // status: marca o span, mas fica fora do Error Tracking — sem excecao nao ha issue, como no Datadog.
+      const err = getErrorTrackingConfig().isClientErrorStatus(response.status)
+        ? Object.assign(new Error(`HTTP ${response.status}`), { name: 'HttpError' })
+        : undefined;
       endOutboundSpan(prepared.begin, {
         name: prepared.name,
         type: 'external',
         attributes: { ...prepared.attributes, http_status_code: response.status },
-        ...(err !== undefined ? { err } : {}),
+        ...(err !== undefined ? { err, errorFromStatus: true } : {}),
       });
     });
     return response;

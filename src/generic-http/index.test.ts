@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getStackTraceClient, init, shutdown } from '../index.js';
 import { resetFailOpenState } from '../core/safe-run.js';
-import { StackTraceHttpRequest } from './index.js';
+import { StackTraceHttpRequest, startHttpRequest } from './index.js';
+import type { BatchTransportPayload } from '../core/stacktrace-client.js';
 
 describe('StackTraceHttpRequest', () => {
   it('creates a trace context with redacted headers and a route label', () => {
@@ -113,5 +114,68 @@ describe('StackTraceHttpRequest fail-open', () => {
     trace.end({ statusCode: 200 });
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(transport).not.toHaveBeenCalled();
+  });
+});
+
+describe('generic-http Error Tracking (3.0)', () => {
+  afterEach(async () => {
+    await shutdown();
+  });
+
+  function initWith(): ReturnType<typeof vi.fn> {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    init({
+      apiKey: 'k',
+      serviceId: '11111111-1111-4111-8111-111111111111',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+    });
+    return transport;
+  }
+
+  const payloads = (transport: ReturnType<typeof vi.fn>): BatchTransportPayload[] =>
+    transport.mock.calls.map((c) => c[0] as BatchTransportPayload);
+
+  it('excecao no run e resposta 500: span com erro e UM evento no span raiz', async () => {
+    const transport = initWith();
+    const trace = startHttpRequest({ method: 'POST', url: '/pay' });
+    await expect(
+      trace.run(() => {
+        throw new Error('gateway caiu');
+      }),
+    ).rejects.toThrow('gateway caiu');
+    trace.end({ statusCode: 500 });
+    await vi.waitFor(() => expect(payloads(transport).some((p) => p.kind === 'batch')).toBe(true));
+    const span = payloads(transport).find((p) => p.kind === 'spans')?.spans[0];
+    expect(span).toMatchObject({ status: 'error', error_type: 'Error', error_message: 'gateway caiu' });
+    const events = payloads(transport).flatMap((p) => (p.kind === 'batch' ? p.events : []));
+    expect(events).toHaveLength(1);
+    expect((events[0]?.context?.trace as { span_id?: string } | undefined)?.span_id).toBe(trace.rootSpanId);
+  });
+
+  it('excecao no run e resposta 404: span ok e nenhum evento', async () => {
+    const transport = initWith();
+    const trace = startHttpRequest({ method: 'GET', url: '/x' });
+    await expect(
+      trace.run(() => {
+        throw new Error('nao existe');
+      }),
+    ).rejects.toThrow();
+    trace.end({ statusCode: 404 });
+    await vi.waitFor(() => expect(payloads(transport).some((p) => p.kind === 'spans')).toBe(true));
+    const span = payloads(transport).find((p) => p.kind === 'spans')?.spans[0];
+    expect(span).toMatchObject({ status: 'ok', error_type: null });
+    expect(payloads(transport).some((p) => p.kind === 'batch')).toBe(false);
+  });
+
+  it('erro passado so no end com 503 vira o evento', async () => {
+    const transport = initWith();
+    const trace = startHttpRequest({ method: 'GET', url: '/y' });
+    await trace.run(() => undefined);
+    trace.end({ statusCode: 503, error: new Error('dependencia fora') });
+    await vi.waitFor(() => expect(payloads(transport).some((p) => p.kind === 'batch')).toBe(true));
+    const events = payloads(transport).flatMap((p) => (p.kind === 'batch' ? p.events : []));
+    expect(events.map((e) => e.message)).toEqual(['dependencia fora']);
   });
 });

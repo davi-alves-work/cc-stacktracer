@@ -4,6 +4,61 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-09-26
+
+Errors now follow the Datadog model: they are captured automatically, a request is an error only on a
+server error status, and each request or job reports one error — the top-most one.
+
+### Added
+
+- **Automatic Error Tracking, on by default.** Every exception recorded on a span — a request that ends
+  with a server error status, a `withTrace` job, a `withSpan`/`startSpan`, a database query, a network
+  failure on an outbound `fetch`/`node:http` call — becomes an error event linked to its trace, with no
+  `captureException`. A job that threw inside `withTrace` used to mark its span and reach nobody's
+  `/errors`; it now does.
+- **One error per request or job.** When the same exception bubbles up through several spans (a query,
+  the repository call around it, the job), or several spans fail, only the error on the top-most span is
+  sent — Datadog's "only the top-most error is kept". It is sent when the request or job finishes; a span
+  that ends after that (work left running after the response) reports right away.
+- `init({ errorTracking })` / `STACKTRACE_ERROR_TRACKING_ENABLED` — turn automatic capture off.
+- `init({ httpServerErrorStatuses })` / `STACKTRACE_HTTP_SERVER_ERROR_STATUSES` — which response statuses
+  make an incoming request an error. Default `"500-599"`.
+- `init({ httpClientErrorStatuses })` / `STACKTRACE_HTTP_CLIENT_ERROR_STATUSES` — which statuses make an
+  outbound call an error. Default `"500-599"`.
+  Both use Datadog's format: codes or ranges from 100 to 599, comma separated (`"500-599,429"`). An
+  invalid value in `init` is an invalid configuration; an invalid environment variable logs a warning and
+  falls back to the default, as Datadog does.
+
+### Changed
+
+- **Breaking — a request is an error only on a server error status.** An exception that the framework
+  turns into a 404 or 400 no longer marks the root HTTP span as an error, in the Fastify, Express and Adonis
+  integrations and in `startHttpRequest`/`endHttpRequest`. On a 5xx, the root span now carries the
+  exception's `error_type` and `error_message`.
+- An outbound call that fails only by status (a 503 with no exception) still marks its span as an error,
+  but is not sent as an error event: there is no exception, so there is nothing to group.
+- `captureException`, automatic capture and `enableGlobalHandlers` share one registry: the same error
+  object becomes at most one event.
+
+### Removed
+
+- **Breaking — `captureErrors`** on the Fastify plugin, the Adonis middleware and
+  `stacktraceErrorMiddleware()`. Capture is automatic now. Passing it at runtime logs a single warning and
+  is ignored.
+
+### Upgrading from 2.x
+
+1. Remove `captureErrors` from the Fastify/Adonis options and call `stacktraceErrorMiddleware()` with no
+   arguments. Express still needs that middleware after the routes: it is the only way to see the
+   exception.
+2. A `captureException` in your error handler can stay — it will not double-count — or go.
+3. Keep `captureException` for errors you catch and handle yourself: those are not captured
+   automatically (Datadog does not capture them in Node either).
+4. **Differences from Datadog, on purpose:** outbound calls default to `500-599` instead of Datadog's
+   `400-499`, so a 404 from an external API ("does this exist?") does not count as an error.
+5. To turn automatic capture off while you migrate: `init({ errorTracking: false })`. The status rule
+   (only 5xx marks a request as an error) applies either way.
+
 ## [2.6.1] - 2026-09-24
 
 ### Fixed

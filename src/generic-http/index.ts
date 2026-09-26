@@ -2,6 +2,8 @@ import { randomBytes } from 'node:crypto';
 import { getStackTraceClient } from '../index.js';
 import { runWithRequestContext, type HttpRequestSnapshot } from '../core/request-context.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
+import { completeLocalRoot, recordBoundaryError } from '../core/error-tracking.js';
+import { httpRootSpanOutcome } from '../integrations/http-root-span-outcome.js';
 import { isTelemetryActive, safeRun } from '../core/safe-run.js';
 import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { extractCorrelationFromHeaders } from '../utils/correlation.js';
@@ -143,7 +145,22 @@ export class StackTraceHttpRequest {
       return fn();
     }
     return runWithRequestContext(this.snapshot, () =>
-      runWithTraceContext(this.traceId, this.rootSpanId, () => fn(), this.remoteParentSpanId, this.traceFlags),
+      runWithTraceContext(
+        this.traceId,
+        this.rootSpanId,
+        async () => {
+          try {
+            return await fn();
+          } catch (err) {
+            // Ainda dentro do contexto: a candidata leva requisicao, usuario e tags. So vira evento se o
+            // `end` vier com status de erro de servidor.
+            recordBoundaryError(err);
+            throw err;
+          }
+        },
+        this.remoteParentSpanId,
+        this.traceFlags,
+      ),
     );
   }
 
@@ -155,6 +172,16 @@ export class StackTraceHttpRequest {
 
   private emitRootSpan(response: StackTraceHttpResponseInput): void {
     this.snapshot.statusCode = response.statusCode;
+    if (response.error !== undefined) {
+      recordBoundaryError(response.error, { traceId: this.traceId, rootSpanId: this.rootSpanId });
+    }
+    // Antes de qualquer corte (cliente ausente, politica de captura): o evento de erro tem politica propria.
+    const { boundaryError } = completeLocalRoot({
+      traceId: this.traceId,
+      rootSpanId: this.rootSpanId,
+      remoteParentSpanId: this.remoteParentSpanId,
+      statusCode: response.statusCode,
+    });
 
     const client = getStackTraceClient();
     if (!client) return;
@@ -174,6 +201,7 @@ export class StackTraceHttpRequest {
     const endIso = new Date(endMs).toISOString();
 
     const httpRoute = normalizeHttpRouteForSpan(this.request.method, this.request.route) ?? this.request.route;
+    const outcome = httpRootSpanOutcome(false, response.statusCode, boundaryError);
     client.enqueueSpan({
       span_timestamp: endIso,
       trace_id: this.traceId,
@@ -187,12 +215,12 @@ export class StackTraceHttpRequest {
       start_time: startIso,
       end_time: endIso,
       duration_us: Math.max(0, Math.round(durationMs * 1000)),
-      status: response.statusCode >= 500 || response.error !== undefined ? 'error' : 'ok',
+      status: outcome.status,
       http_method: this.request.method,
       http_route: httpRoute.slice(0, 4096),
       http_status_code: response.statusCode,
-      error_type: response.error?.name ?? null,
-      error_message: response.error !== undefined ? response.error.message.slice(0, 16_000) : null,
+      error_type: outcome.error_type,
+      error_message: outcome.error_message,
     });
   }
 }
