@@ -302,9 +302,11 @@ When query code throws:
   repository calls). Without it, spans nest under whichever query happens to still be open when a
   sibling starts, producing a fake parent/child chain instead of siblings under the enclosing
   span. With `leaf: true` each query attaches directly to the enclosing span regardless of timing.
-- **`captureError: false`** — use when the calling code already captures the exception at a
-  higher boundary (e.g. the global HTTP error handler in section 10). Without it, a query error
-  wrapped in `runQuery` is captured twice: once here, once at the handler.
+- **`captureError: false`** — `runQuery` sends no error event of its own. Since 3.0.1 you rarely
+  need it: inside a request or a `withTrace` job a failed query reaches `/errors` once, through
+  Error Tracking, with its `db` block — and a `captureException` on the same error object at the
+  handler does not add a second event. It only changes anything outside a trace or with
+  `errorTracking: false`.
 
 ```ts
 await Promise.all([
@@ -594,8 +596,8 @@ Ensure operation names are stable and searchable.
 Add minimal metadata (system, operation, table/collection) and keep error rethrow behavior intact.
 Use `leaf: true` on any query that runs concurrently with others (Promise.all / parallel
 repository calls) so spans don't nest into each other — see section 8.
-Use `captureError: false` when the caller already captures the exception at the HTTP boundary, to
-avoid double-capturing the same failure.
+Do not add `captureError: false` to avoid duplicates: a failed query inside a request or job
+reaches /errors once (Error Tracking, SDK 3.0.1+), even when the handler also calls captureException.
 ```
 
 ### Prompt D - Final verification audit
@@ -1450,7 +1452,9 @@ Defined in `MetadataSchema` (strict — only listed keys allowed).
 | `statement` | string ≤500? | Truncated SQL (no secrets) |
 | `rows` | int? | Rows read/affected |
 
-Populated automatically when using `runQuery`; manual `captureException` should set when DB failed.
+Populated automatically when `runQuery` fails — whichever path sends the error (Error Tracking, or a
+`captureException` on the same error object) carries the `db` block. For a DB failure outside
+`runQuery`, set it in the `captureException` context.
 
 #### `metadata.business`
 

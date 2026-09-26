@@ -52,6 +52,14 @@ export type NormalizeOptions = {
   onDroppedContextKey?: (key: string) => void;
 };
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** O id que o evento já traz (`eventId`/`event_id`) — estável entre retries. Só sorteia na falta dele. */
+function pickEventId(o: Record<string, unknown>): string {
+  const candidate = o.eventId ?? o.event_id;
+  return typeof candidate === 'string' && UUID_RE.test(candidate) ? candidate.toLowerCase() : randomUUID();
+}
+
 function pickMessage(o: Record<string, unknown>): string {
   const m = o.message ?? o.msg;
   if (typeof m === 'string' && m.length > 0) return m;
@@ -172,10 +180,13 @@ function pickTags(meta: Record<string, unknown>): Record<string, string> | undef
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * `user` fica: o mapper v4 le a identidade de `metadata.user` (com `tenantId`/`emailHash`, que o bloco
+ * canonico `user` nao carrega). Tirada daqui, `setUser()` nunca chegava ao fio.
+ */
 function stripReserved(meta: Record<string, unknown>): Record<string, unknown> {
   const rest = { ...meta };
   delete rest.trace;
-  delete rest.user;
   delete rest.tags;
   delete rest.http;
   delete rest.db;
@@ -392,7 +403,9 @@ function finalizeServiceAndHttp<T extends CanonicalInput>(event: T): T {
     const routeEmpty = http.route === undefined || (typeof http.route === 'string' && http.route.trim() === '');
     const hasTemplate = typeof http.route_template === 'string' && http.route_template.trim() !== '';
     if (routeEmpty && !hasTemplate && method !== undefined && url !== undefined) {
-      http = { ...http, route: `${method} ${pathnameFromUrl(url)}` };
+      // So o path (mascarado adiante por pickV3HttpRoute), como o `http_route` dos spans. O prefixo
+      // "METHOD " duplicava o metodo na tela e impedia casar o log/erro com a rota do span.
+      http = { ...http, route: pathnameFromUrl(url) };
     }
   }
 
@@ -433,7 +446,7 @@ export function coerceToCanonicalInput(input: unknown, opts?: NormalizeOptions):
   }
 
   const event: CanonicalInput = {
-    event_id: randomUUID(),
+    event_id: pickEventId(o),
     timestamp: pickTimestamp(o),
     type,
     level,

@@ -8,6 +8,8 @@ export type BuildErrorEventParams = {
   environment: string;
   error: Error;
   context?: Record<string, unknown>;
+  /** Instante da excecao (ISO). Ausente = agora. */
+  timestamp?: string;
 };
 
 export function buildErrorEvent(params: BuildErrorEventParams): ErrorEvent {
@@ -17,7 +19,7 @@ export function buildErrorEvent(params: BuildErrorEventParams): ErrorEvent {
     type: 'error',
     service: params.service,
     environment: params.environment,
-    timestamp: nowIso(),
+    timestamp: params.timestamp ?? nowIso(),
     message: params.error.message,
     ...(params.error.stack !== undefined ? { stack: sanitizeStackTrace(params.error.stack) } : {}),
     ...(params.error.name !== undefined ? { name: params.error.name } : {}),

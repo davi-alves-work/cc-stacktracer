@@ -212,16 +212,19 @@ If raw SQL is generated dynamically, the code must prove untrusted values are pa
 
 ## 8) Error Handling in Adonis
 
-Capture exceptions in one centralized exception flow.
+Since SDK 3.0 the Adonis middleware sees the exception and, when the exception handler answers with a
+server error status (default `500-599`), sends it as ONE error event linked to the root HTTP span. No
+`captureException` is required for that; an exception mapped to a 4xx is not an error.
 
 Recommended flow:
 
 1. Controllers/services throw.
-2. Adonis exception handler maps user-facing response.
-3. Internal monitor builds safe context.
-4. cc-stacktracer transport calls `StackTrace.captureException`.
+2. Adonis exception handler maps the user-facing response — the status decides.
+3. The SDK sends the error event automatically.
+4. Optionally, the internal monitor calls `StackTrace.captureException(error, context)` with the same
+   error object to add safe diagnostic context — still one event.
 
-Context should include:
+Context, when added, should include:
 
 - error ID
 - internal code
@@ -238,8 +241,8 @@ Rules:
 - preserve original errors internally
 - never expose stack traces to users
 - never expose SQL, table, column, or driver messages to users
-- avoid duplicate captures unless intentional
-- document known duplicate paths, such as DB failure plus HTTP boundary capture
+- the same error object becomes at most one event (automatic capture, `captureException`, global
+  handlers); a DB failure that reaches the handler as a 5xx is one event, carrying the query's `db` block
 - sanitize nested metadata before forwarding
 
 ---

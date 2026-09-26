@@ -57,6 +57,8 @@ export {
   evaluateCapture,
   evaluateCaptureDiagnostics,
   parseAndCompileCapturePolicy,
+  samplingRandomForKey,
+  samplingValueForKey,
   spanRowToCaptureEventType,
 } from './capture-policy-engine.js';
 export { CAPTURE_POLICY_REDIS_CHANNEL, capturePolicyRedisUpdatePayloadSchema } from './capture-policy-redis-payload.js';

@@ -233,6 +233,29 @@ function ruleMatches(rule: CompiledCaptureRule, eventType: CaptureEventType, ctx
   return true;
 }
 
+/**
+ * Valor de amostragem em [0, 1) DERIVADO de uma chave — o `trace_id` (ou o `event_id` de um evento sem
+ * trace). Com `Math.random`, o SDK e o servidor sorteavam cada um por conta propria sobre o mesmo item
+ * (`sampleRate` 0,5 virava 0,125 no span HTTP), e cada span do mesmo trace tinha a sua sorte: sobravam
+ * traces sem raiz ou sem filhos. Com o valor derivado da chave, as duas pontas decidem igual e o trace
+ * inteiro fica ou sai junto. FNV-1a 32 bits: estavel entre runtimes, sem dependencia.
+ */
+export function samplingValueForKey(key: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < key.length; i++) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) / 0x1_0000_0000;
+}
+
+/** `random` para {@link evaluateCapture} a partir da chave, ou `undefined` (cai no default) sem chave. */
+export function samplingRandomForKey(key: string | null | undefined): (() => number) | undefined {
+  if (key === undefined || key === null || key.trim() === '' || /^0+$/.test(key)) return undefined;
+  const value = samplingValueForKey(key.toLowerCase());
+  return () => value;
+}
+
 export type EvaluateCaptureOptions = {
   random?: () => number;
   /** When false, skip critical short-circuit (tests / special callers). */

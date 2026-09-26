@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { normalizeEventV4, type NormalizeOptions } from '../shared/schema/index.js';
 import type { ParsedStackTraceInit } from './config.schema.js';
@@ -16,6 +17,7 @@ import { sendWithFetch } from './transport/default-fetch-transport.js';
 import { IngestTransportError } from './transport/ingest-transport-error.js';
 import { signIngestionRequest } from './transport/ingestion-signing.js';
 import { toJsonSafe } from './transport/json-safe.js';
+import { sanitizeSpanRow } from './transport/span-row-sanitize.js';
 import { isTelemetryActive, reportInternalFailure } from './safe-run.js';
 
 const DEFAULT_MAX_BATCH_SIZE = 50;
@@ -25,6 +27,9 @@ const DEFAULT_SPANS_PATH = '/v1/spans';
 /** Com o ingest fora do ar a fila só cresce: sem teto, a memória da app vira o limite. */
 const DEFAULT_MAX_QUEUE_SIZE = 1_000;
 const DEFAULT_MAX_SPAN_QUEUE_SIZE = 10_000;
+/** Tetos por lote do servidor (`v1EventsBatchSchema` / `spansV4BatchSchema`): acima deles todo lote e 400. */
+const SERVER_MAX_EVENTS_PER_BATCH = 100;
+const SERVER_MAX_SPANS_PER_BATCH = 500;
 
 /** Path da URL do POST, alinhado com `req.url` do Fastify na canónica do servidor (sem query). */
 function ingestPathForSignature(fullUrl: string, fallback: string): string {
@@ -122,14 +127,14 @@ export class StackTraceClient {
     }
     this.queue = new EventQueue({
       sendMode: config.sendMode,
-      maxBatchSize: config.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE,
+      maxBatchSize: Math.min(config.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE, SERVER_MAX_EVENTS_PER_BATCH),
       flushIntervalMs: config.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
       maxQueueSize: config.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE,
       deliver: (batch) => this.deliverBatch(batch),
     });
     this.spanQueue = new SpanQueue({
       sendMode: config.sendMode,
-      maxBatchSize: config.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE,
+      maxBatchSize: Math.min(config.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE, SERVER_MAX_SPANS_PER_BATCH),
       flushIntervalMs: config.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
       maxQueueSize: config.maxQueueSize ?? DEFAULT_MAX_SPAN_QUEUE_SIZE,
       deliver: (batch) => this.deliverSpanBatch(batch),
@@ -144,7 +149,7 @@ export class StackTraceClient {
       if (this.captureGate !== null && !this.captureGate.shouldCaptureSpan(row)) {
         return;
       }
-      this.spanQueue.enqueue(this.attachLegacySpanScope(this.withJsonSafeAttributes(row)));
+      this.spanQueue.enqueue(this.attachLegacySpanScope(this.withJsonSafeAttributes(sanitizeSpanRow(row))));
     } catch (err) {
       reportInternalFailure('client.enqueueSpan', err);
     }
@@ -155,8 +160,10 @@ export class StackTraceClient {
       return;
     }
     let next: StackTraceEvent | null;
+    // O id nasce ANTES da politica de captura: ele e a chave da amostragem deterministica de evento sem trace.
+    const withId: StackTraceEvent = event.eventId !== undefined ? event : { ...event, eventId: randomUUID() };
     try {
-      next = this.config.beforeSend ? this.config.beforeSend(event) : event;
+      next = this.config.beforeSend ? this.config.beforeSend(withId) : withId;
     } catch (err) {
       // `beforeSend` costuma ser a redação de PII do cliente: se ela falhou, o evento NÃO sai.
       reportInternalFailure('client.beforeSend', err);
@@ -202,7 +209,7 @@ export class StackTraceClient {
     }
 
     const extra: Record<string, unknown> = {
-      runtime: { node: process.version },
+      runtime: { node: process.version, platform: process.platform, arch: process.arch },
       resource,
     };
     if (this.config.release !== undefined) {
@@ -213,7 +220,7 @@ export class StackTraceClient {
       Object.assign(extra, scope);
     }
     const merged = { ...extra, ...event.context };
-    return { ...event, context: merged } as StackTraceEvent;
+    return { ...event, eventId: event.eventId ?? randomUUID(), context: merged } as StackTraceEvent;
   }
 
   /** `attributes` vêm do cliente e vão direto para `JSON.stringify({ spans })`, sem normalizador no meio. */
@@ -372,7 +379,19 @@ export class StackTraceClient {
     if (this.config.logger?.warn !== undefined) {
       normalizeOpts.onDroppedContextKey = (key: string) => this.warnDroppedContextKey(key);
     }
-    const canonical = wire.map((item) => normalizeEventV4(item, normalizeOpts));
+    // Evento a evento: um que nao normaliza sai SOZINHO (com aviso), em vez de reprovar o lote inteiro e
+    // travar a fila em retries que nunca passam.
+    const canonical: ReturnType<typeof normalizeEventV4>[] = [];
+    for (const item of wire) {
+      try {
+        canonical.push(normalizeEventV4(item, normalizeOpts));
+      } catch (err) {
+        reportInternalFailure('client.normalizeEvent', err);
+      }
+    }
+    if (canonical.length === 0) {
+      return;
+    }
     const body = JSON.stringify({ events: canonical });
     const headers: Record<string, string> = {
       ...(this.config.getHeaders?.() ?? {}),

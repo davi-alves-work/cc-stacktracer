@@ -24,7 +24,7 @@ Requires Node.js 18 or newer. TypeScript types are bundled.
 Initialize once at startup:
 
 ```ts
-import { StackTrace } from 'cc-stacktracer';
+import { StackTrace, withTrace } from 'cc-stacktracer';
 
 StackTrace.init({
   apiKey: process.env.STACKTRACE_API_KEY!,
@@ -44,16 +44,20 @@ StackTrace.logStructured({
   attributes: { invoiceId, userId: auth.user.id, result: 'success' },
 });
 
-// Error with context
+// Errors are captured automatically: a request that ends with a 5xx, a failed query, a job that
+// throws inside withTrace — one event per request or job, linked to its trace.
+// captureException is for errors you catch and handle yourself:
 try {
   await approveInvoice(id);
 } catch (err) {
-  StackTrace.captureException(err as Error, {
-    http: { method: 'POST', route: '/invoices/:id/approve', status_code: 500, duration_ms: 842 },
-    correlation: { requestId: req.id },
-  });
-  throw err;
+  StackTrace.captureException(err as Error, { invoiceId: id });
+  return reply.status(409).send({ error: 'Invoice could not be approved' });
 }
+
+// Jobs, consumers, crons and CLIs: open a trace so spans, logs and errors correlate
+await withTrace('job.reprocess-invoices', async () => {
+  await reprocessInvoices();
+});
 
 // Database call — emits a timed span with system/operation/table
 await StackTrace.runQuery('postgres', 'invoices.update', () => db.query(sql), { table: 'invoices' });
@@ -64,7 +68,8 @@ await StackTrace.withBusinessContextAsync({ entity: 'invoice', operation: 'appro
 });
 ```
 
-That gives you correlated logs, errors, and a trace waterfall with DB timings.
+That gives you correlated logs, errors, and a trace waterfall with DB timings. Automatic error capture
+follows Datadog's model; see the CHANGELOG entry for 3.0.0 to tune or turn it off.
 
 ---
 
@@ -137,15 +142,17 @@ Using Cursor? Copy `node_modules/cc-stacktracer/cursor-rules/*.mdc` into your pr
 | `auto(options)` | `init` plus optional framework/outbound auto-wiring |
 | `log(message, metadata?)` | Simple log |
 | `logStructured({ level, message, attributes })` | Structured log |
-| `captureException(error, context?)` | Error event |
+| `captureException(error, context?)` | Error event for an error you handle yourself (the rest are automatic) |
 | `runQuery(system, name, fn, options?)` | Timed DB span |
 | `measure(name, fn, options?)` | Timed span for arbitrary work |
 | `withSpan(name, fn, options?)` | Manual span |
+| `withTrace(name, fn, options?)` | Root span for a job, consumer, cron or CLI |
 | `withBusinessContext(ctx, fn)` | Scope `entity`/`operation` onto spans and events |
 | `setUser(user)` / `tag(key, value)` | Scope metadata |
 | `flush()` / `shutdown()` | Drain the queue on graceful shutdown |
 
-Every public API is available both on the `StackTrace` object and as a named export.
+Every function in this table is available both on the `StackTrace` object and as a named export,
+except `withTrace`, which is a named export only (`import { withTrace } from 'cc-stacktracer'`).
 
 ---
 

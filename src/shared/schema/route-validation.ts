@@ -1,5 +1,11 @@
 /** UUID v4 (loose) pattern for route segments that should be patterns instead. */
-const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/**
+ * Qualquer UUID (v1 a v8 — o v7 e o default de Postgres 18/Prisma e ficava cru na rota), ObjectId do
+ * Mongo (24 hex) e ULID (26 Crockford). Cada um desses crus na rota vira uma rota por valor.
+ */
+const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const OBJECT_ID_SEGMENT = /^[0-9a-f]{24}$/i;
+const ULID_SEGMENT = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 
 /**
  * Returns true if a path segment looks like a raw id (numeric only or UUID) — bad for `/users/:id` rollups.
@@ -11,7 +17,7 @@ export function segmentLooksLikeRawId(segment: string): boolean {
   if (/^\d+$/.test(segment)) {
     return true;
   }
-  if (UUID_SEGMENT.test(segment)) {
+  if (UUID_SEGMENT.test(segment) || OBJECT_ID_SEGMENT.test(segment) || ULID_SEGMENT.test(segment)) {
     return true;
   }
   return false;

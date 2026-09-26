@@ -26,22 +26,36 @@ type Candidate = {
   parentSpanId: string | null;
   depth: number;
   context: Record<string, unknown> | undefined;
+  /**
+   * Quando a excecao aconteceu. O evento so e montado quando a raiz fecha (fim da requisicao, ou ate
+   * 10 min depois numa raiz presa) — sem isto o horario do erro era o do fim da requisicao.
+   */
+  occurredAt: string;
 };
 
 type RootErrors = {
   createdAt: number;
   best?: Candidate;
-  boundary?: { error: Error; context: Record<string, unknown> | undefined };
+  boundary?: { error: Error; context: Record<string, unknown> | undefined; occurredAt: string };
 };
 
 /** Erros ja enviados. WeakSet e nao marca no objeto: o erro e do app, pode estar congelado. */
 let capturedErrors = new WeakSet<object>();
+/** Erros que uma raiz aberta guardou como candidatos: o evento deles e do Error Tracking, ganhem ou nao. */
+let trackedErrors = new WeakSet<object>();
+/**
+ * O que o SDK sabe de um erro e o span nao carrega — o bloco `db` de uma query, o `performance` de um
+ * `measure`. Entra no evento qualquer que seja o caminho que o envia.
+ */
+let errorAnnotations = new WeakMap<object, Record<string, unknown>>();
 const pending = new Map<string, RootErrors>();
 /** Raizes ja fechadas (LRU pela ordem de insercao): erro que chega depois sai na hora. */
 const closed = new Map<string, true>();
 
 export function resetErrorTrackingState(): void {
   capturedErrors = new WeakSet<object>();
+  trackedErrors = new WeakSet<object>();
+  errorAnnotations = new WeakMap<object, Record<string, unknown>>();
   pending.clear();
   closed.clear();
 }
@@ -65,6 +79,50 @@ export function isErrorCaptured(error: unknown): boolean {
   return typeof error === 'object' && error !== null && capturedErrors.has(error);
 }
 
+/** O Error Tracking ja responde por este erro: quem capturava por conta propria (`runQuery`, `measure`) se cala. */
+export function isErrorTracked(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && trackedErrors.has(error);
+}
+
+export function annotateError(error: Error, context: Record<string, unknown>): void {
+  errorAnnotations.set(error, { ...errorAnnotations.get(error), ...context });
+}
+
+/** O contexto explicito vence a anotacao: quem chama `captureException` sabe mais do que o SDK. */
+function withAnnotation(
+  error: Error,
+  context: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  const annotation = errorAnnotations.get(error);
+  return annotation === undefined ? context : { ...annotation, ...context };
+}
+
+function enqueueError(error: Error, context: Record<string, unknown> | undefined, occurredAt?: string): void {
+  const { client, initConfig } = getSdkRuntime();
+  if (client === null || initConfig === null) return;
+  markErrorCaptured(error);
+  const merged = withAnnotation(error, context);
+  client.enqueue(
+    buildErrorEvent({
+      service: initConfig.service,
+      environment: initConfig.environment,
+      error,
+      ...(merged !== undefined ? { context: merged } : {}),
+      ...(occurredAt !== undefined ? { timestamp: occurredAt } : {}),
+    }),
+  );
+}
+
+/**
+ * Envio fora do Error Tracking — `captureException`, o handler global, a query sem trace. Um objeto de erro
+ * vira no maximo UM evento, venha de onde vier: quem ja chamava `captureException` no error handler e
+ * relancava nao passa a contar em dobro com a captura automatica.
+ */
+export function captureErrorOnce(error: Error, context?: Record<string, unknown>): void {
+  if (isErrorCaptured(error)) return;
+  enqueueError(error, context);
+}
+
 function traceBlock(traceId: string, spanId: string, parentSpanId: string | null | undefined): Record<string, unknown> {
   return {
     trace_id: traceId,
@@ -81,19 +139,23 @@ function contextFor(traceId: string, spanId: string, parentSpanId: string | null
   };
 }
 
+/**
+ * O status que a requisicao REALMENTE devolveu. O contexto do candidato foi tirado quando a excecao
+ * aconteceu, antes de existir resposta — e saia com `status_code: 0`, fosse a resposta 404, 500 ou 200.
+ * Sem o status, o painel nao separava erro de cliente de erro de aplicacao.
+ */
+function withFinalStatus(candidate: Candidate, statusCode: number | undefined): Candidate {
+  const http = candidate.context?.http;
+  if (statusCode === undefined || typeof http !== 'object' || http === null) return candidate;
+  return {
+    ...candidate,
+    context: { ...candidate.context, http: { ...(http as Record<string, unknown>), response_status_code: statusCode } },
+  };
+}
+
 function emit(candidate: Candidate): void {
   if (!getErrorTrackingConfig().enabled || isErrorCaptured(candidate.error)) return;
-  const { client, initConfig } = getSdkRuntime();
-  if (client === null || initConfig === null) return;
-  markErrorCaptured(candidate.error);
-  client.enqueue(
-    buildErrorEvent({
-      service: initConfig.service,
-      environment: initConfig.environment,
-      error: candidate.error,
-      ...(candidate.context !== undefined ? { context: candidate.context } : {}),
-    }),
-  );
+  enqueueError(candidate.error, candidate.context, candidate.occurredAt);
 }
 
 function markClosed(key: string): void {
@@ -142,6 +204,7 @@ export function recordSpanError(params: {
     const candidate: Candidate = {
       ...params,
       context: contextFor(params.traceId, params.spanId, params.parentSpanId),
+      occurredAt: new Date().toISOString(),
     };
     const root = currentRoot();
     const key =
@@ -151,6 +214,7 @@ export function recordSpanError(params: {
       return;
     }
     const entry = pendingRoot(key);
+    trackedErrors.add(params.error);
     if (entry.best === undefined || candidate.depth < entry.best.depth) entry.best = candidate;
   });
 }
@@ -164,7 +228,9 @@ export function recordBoundaryError(error: unknown, root?: { traceId: string; ro
     const target = root ?? currentRoot();
     if (target === undefined || !(error instanceof Error)) return;
     const entry = pendingRoot(rootKey(target.traceId, target.rootSpanId));
-    if (entry.boundary === undefined) entry.boundary = { error, context: mergeEventContext() };
+    if (entry.boundary === undefined) {
+      entry.boundary = { error, context: mergeEventContext(), occurredAt: new Date().toISOString() };
+    }
   });
 }
 
@@ -199,6 +265,7 @@ export function completeLocalRoot(params: {
           spanId: params.rootSpanId,
           parentSpanId: params.remoteParentSpanId ?? null,
           depth: 0,
+          occurredAt: entry.boundary.occurredAt,
           context: {
             ...base,
             ...(typeof http === 'object' && http !== null
@@ -209,7 +276,7 @@ export function completeLocalRoot(params: {
           },
         };
       }
-      if (winner !== undefined) emit(winner);
+      if (winner !== undefined) emit(withFinalStatus(winner, params.statusCode));
       return serverError && entry.boundary !== undefined ? { boundaryError: entry.boundary.error } : {};
     }) ?? {}
   );

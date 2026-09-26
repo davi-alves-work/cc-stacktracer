@@ -64,6 +64,8 @@ export class SpanQueue {
   private consecutiveFailures = 0;
   private headAttempts = 0;
   private inFlightImmediate = 0;
+  /** Envios do modo `immediate` em andamento: `flushPending` espera por eles (shutdown, crash, CLI). */
+  private readonly immediateSends = new Set<Promise<void>>();
 
   constructor(private readonly options: SpanQueueOptions) {}
 
@@ -88,7 +90,7 @@ export class SpanQueue {
       return;
     }
     this.inFlightImmediate += 1;
-    runDetached('spanQueue.deliverImmediate', async () => {
+    const send = (async () => {
       try {
         await this.options.deliver([row]);
       } catch {
@@ -96,11 +98,16 @@ export class SpanQueue {
       } finally {
         this.inFlightImmediate -= 1;
       }
-    });
+    })();
+    this.immediateSends.add(send);
+    runDetached('spanQueue.deliverImmediate', () => send.finally(() => this.immediateSends.delete(send)));
   }
 
   async flushPending(): Promise<void> {
     if (this.options.sendMode === 'immediate') {
+      // Sem isto `flush()`/`shutdown()` voltavam na hora e o processo saía com os envios no ar —
+      // inclusive o evento de crash dos handlers globais, antes do `process.exit`.
+      await Promise.allSettled([...this.immediateSends]);
       return;
     }
     this.emitMetric('spanqueue_shutdown_flush_total', 1);

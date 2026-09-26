@@ -5,7 +5,7 @@ import { runWithTraceContext } from '../core/trace-span-context.js';
 import { completeLocalRoot, recordBoundaryError } from '../core/error-tracking.js';
 import { httpRootSpanOutcome } from '../integrations/http-root-span-outcome.js';
 import { isTelemetryActive, safeRun } from '../core/safe-run.js';
-import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
+import { maskDynamicRouteSegments, normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { extractCorrelationFromHeaders } from '../utils/correlation.js';
 import { headersToRecord } from '../utils/headers.js';
 import { redactHeaders } from '../utils/redact-headers.js';
@@ -34,8 +34,9 @@ export type StackTraceHttpRequestSnapshot = {
   headers: Record<string, string>;
 };
 
+/** Path sem query e com os ids mascarados — a rota de quem nao informou . */
 function pathOnly(url: string): string {
-  return url.split('?')[0] ?? url;
+  return maskDynamicRouteSegments(url.split('?')[0] ?? url);
 }
 
 function headersWithOverrides(input: StackTraceHttpRequestInput): Record<string, string | string[] | undefined> {
@@ -109,6 +110,7 @@ export class StackTraceHttpRequest {
       method: input.method,
       url,
       headers,
+      ...(input.route !== undefined && input.route.trim() !== '' ? { route: input.route } : {}),
     };
 
     return new StackTraceHttpRequest({
@@ -185,15 +187,7 @@ export class StackTraceHttpRequest {
 
     const client = getStackTraceClient();
     if (!client) return;
-
-    if (
-      !client.shouldCaptureHttpRequest({
-        endpoint: this.request.route,
-        status_code: response.statusCode,
-      })
-    ) {
-      return;
-    }
+    // Politica de captura: decidida uma vez so, em `enqueueSpan` (ver fastify.ts).
 
     const endMs = Date.now();
     const durationMs = Math.max(0, endMs - this.startTime);

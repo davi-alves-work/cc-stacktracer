@@ -68,11 +68,36 @@ export function pushActiveSpan(spanId: string): void {
   }
 }
 
-export function popActiveSpan(): void {
+/**
+ * Remove o span da pilha. Com `spanId`, remove ESSE span (a ultima ocorrencia), e nao o topo: com
+ * `startSpan` concorrentes o topo pode ser de outro span, e um `pop` cego tiraria o span errado.
+ */
+export function popActiveSpan(spanId?: string): void {
   const s = storage.getStore();
-  if (s !== undefined && s.spanStack.length > 0) {
-    s.spanStack.pop();
+  if (s === undefined || s.spanStack.length === 0) {
+    return;
   }
+  if (spanId === undefined) {
+    s.spanStack.pop();
+    return;
+  }
+  const index = s.spanStack.lastIndexOf(spanId);
+  if (index > 0) {
+    s.spanStack.splice(index, 1);
+  }
+}
+
+/**
+ * Roda `fn` com `spanId` como span corrente num contexto PROPRIO — copia da pilha, nao a mesma
+ * referencia. A pilha mutavel compartilhada pela requisicao fazia `Promise.all([withSpan(a),
+ * withSpan(b)])` pendurar `b` em `a`, e o `pop` de `a` remover `b`.
+ */
+export function runWithChildSpan<T>(spanId: string, fn: () => T): T {
+  const s = storage.getStore();
+  if (s === undefined) {
+    return fn();
+  }
+  return storage.run({ ...s, spanStack: [...s.spanStack, spanId] }, fn);
 }
 
 /** Root span id (first on stack) when inside Fastify request trace context. */

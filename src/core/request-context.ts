@@ -11,7 +11,18 @@ export type HttpRequestSnapshot = {
   headers: Record<string, string>;
   /** Set by the Fastify plugin when the response status is known (may be undefined if an error is captured before send). */
   statusCode?: number;
+  /**
+   * Template da rota (`/users/:id`), lido na hora em que o evento sai: no Express o template so existe
+   * depois do roteamento, entao a integracao passa uma funcao em vez do valor. Sem ele o evento caia no
+   * path mascarado, e rotas com slug/UUID v7 viravam uma rota por valor.
+   */
+  route?: string | (() => string | undefined);
 };
+
+function resolveRoute(snap: HttpRequestSnapshot): string | undefined {
+  const route = typeof snap.route === 'function' ? snap.route() : snap.route;
+  return typeof route === 'string' && route.trim() !== '' ? route : undefined;
+}
 
 const storage = new AsyncLocalStorage<HttpRequestSnapshot>();
 
@@ -80,9 +91,11 @@ export function mergeEventContext(explicit?: Record<string, unknown>): Record<st
   const snap = getRequestSnapshot();
   if (snap !== undefined) {
     const corrFromHeaders = extractCorrelationFromHeaders(snap.headers);
+    const routeTemplate = resolveRoute(snap);
     const httpLayer: Record<string, unknown> = {
       method: snap.method,
       url: snap.url,
+      ...(routeTemplate !== undefined ? { route_template: routeTemplate } : {}),
       headers: snap.headers,
       ...(snap.statusCode !== undefined ? { response_status_code: snap.statusCode } : {}),
     };

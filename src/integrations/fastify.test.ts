@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import Fastify from 'fastify';
-import { createStackTraceClient, init, shutdown } from '../index.js';
+import { createStackTraceClient, flush, init, runQuery, shutdown } from '../index.js';
 import type { BatchTransportPayload } from '../core/stacktrace-client.js';
 import type { StackTraceEvent } from '../core/stacktrace-event.types.js';
 import stacktracePlugin from './fastify.js';
@@ -212,6 +212,41 @@ describe('Fastify plugin', () => {
     expect(span?.span_id).toMatch(/^[0-9a-f]{16}$/);
     const trace = errors[0]?.context?.trace as { trace_id?: string; span_id?: string } | undefined;
     expect(trace).toMatchObject({ trace_id: span?.trace_id, span_id: span?.span_id });
+    await app.close();
+  });
+
+  it('query que falha e sobe ate um 500: UM evento, no span raiz, com o bloco db da query', async () => {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    initWith(transport);
+    const app = Fastify();
+    await app.register(stacktracePlugin);
+    app.get('/users', async () =>
+      runQuery(
+        'postgres',
+        'User.findMany',
+        async () => {
+          throw new Error('connection refused');
+        },
+        { table: 'users' },
+      ),
+    );
+
+    const res = await app.inject({ method: 'GET', url: '/users' });
+    expect(res.statusCode).toBe(500);
+
+    await vi.waitFor(() => expect(sentPayloads(transport).some((item) => item.kind === 'batch')).toBe(true));
+    await flush();
+    const errors = sentEvents(transport).filter((event) => event.type === 'error');
+    expect(errors).toHaveLength(1);
+    const root = sentPayloads(transport)
+      .flatMap((item) => (item.kind === 'spans' ? item.spans : []))
+      .find((span) => span.span_type === 'http');
+    expect(errors[0]?.context).toMatchObject({
+      captured_by: 'error-tracking',
+      trace: { span_id: root?.span_id },
+      http: { response_status_code: 500 },
+      db: { system: 'postgres', table: 'users' },
+    });
     await app.close();
   });
 

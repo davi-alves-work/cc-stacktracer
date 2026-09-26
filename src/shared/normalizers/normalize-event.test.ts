@@ -89,6 +89,25 @@ describe('eventV1ToV4 — user e subtenant', () => {
 
   // O subtenant ja chegava ao servidor como tag — os writers leem `metadata.tags.subtenant` como
   // fallback desde 2026-08-27. Mapea-lo para o campo canonico so evita a duplicacao no saco de tags.
+  it('setUser chega ao fio: o evento interno do SDK (context.user) sai com metadata.user', () => {
+    // O caminho real: o cliente normaliza o evento interno (schemaVersion 1, `context`) — nao um CanonicalInput
+    // pronto. Ate a 3.0.0 o `user` era tirado do metadata na coercao e o mapper v4 nunca o via.
+    const result = normalizeEventV4(
+      {
+        schemaVersion: 1,
+        type: 'log',
+        message: 'hi',
+        service: { name: 'svc', version: '1.0.0', environment: 'prod' },
+        environment: 'prod',
+        timestamp: '2026-07-20T00:00:00.000Z',
+        context: { user: { id: 'u-1', tenantId: 't-9', emailHash: 'abc' } },
+      },
+      { serviceId },
+    );
+    expect(result.metadata.user).toEqual({ id: 'u-1', end_user_tenant: 't-9', email_hash: 'abc' });
+    expect(result.metadata.tags?.user).toBeUndefined();
+  });
+
   it('mapeia metadata.subtenant para o campo canonico em vez de virar tag', () => {
     const result = eventV1ToV4(baseInput({ metadata: { subtenant: 'pm-peruibe' } }), { serviceId });
     expect(result.metadata.subtenant).toBe('pm-peruibe');

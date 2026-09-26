@@ -45,6 +45,8 @@ export class EventQueue {
   private consecutiveFailures = 0;
   private headAttempts = 0;
   private inFlightImmediate = 0;
+  /** Envios do modo `immediate` em andamento: `flushPending` espera por eles (shutdown, crash, CLI). */
+  private readonly immediateSends = new Set<Promise<void>>();
 
   constructor(private readonly options: EventQueueOptions) {}
 
@@ -69,6 +71,9 @@ export class EventQueue {
    */
   async flushPending(): Promise<void> {
     if (this.options.sendMode === 'immediate') {
+      // Sem isto `flush()`/`shutdown()` voltavam na hora e o processo saía com os envios no ar —
+      // inclusive o evento de crash dos handlers globais, antes do `process.exit`.
+      await Promise.allSettled([...this.immediateSends]);
       return;
     }
     await this.runFlush(true);
@@ -92,7 +97,7 @@ export class EventQueue {
       return;
     }
     this.inFlightImmediate += 1;
-    runDetached('eventQueue.deliverImmediate', async () => {
+    const send = (async () => {
       try {
         await this.options.deliver([event]);
       } catch {
@@ -100,7 +105,9 @@ export class EventQueue {
       } finally {
         this.inFlightImmediate -= 1;
       }
-    });
+    })();
+    this.immediateSends.add(send);
+    runDetached('eventQueue.deliverImmediate', () => send.finally(() => this.immediateSends.delete(send)));
   }
 
   private ensureInterval(): void {

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getStackTraceClient, init, shutdown } from '../index.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
+import { withTrace } from '../core/tracing.js';
 import { createPrismaStackTracePlugin, createStackTracePrismaQueryExtension } from './prisma.js';
 import type { StackTraceContext } from '../core/plugins/types.js';
 import type { BatchTransportPayload, StackTraceEvent } from '../index.js';
@@ -153,12 +154,13 @@ describe('db-prisma plugin', () => {
       expect(span.duration_us).toBeGreaterThanOrEqual(8_000);
     });
 
-    it('marks the span as error and captures an error event with the measured duration when the query rejects', async () => {
+    it('marks the span as error and sends ONE error event, with the measured duration, when the query rejects', async () => {
       const transport = setup();
       const { allOperations } = extensionHandlers();
 
+      // withTrace, not a bare trace context: the event is sent when the local root closes (Error Tracking).
       await expect(
-        runWithTraceContext(traceId, rootSpanId, () =>
+        withTrace('job.orders', () =>
           allOperations({
             model: 'Order',
             operation: 'update',
@@ -178,8 +180,9 @@ describe('db-prisma plugin', () => {
       expect(span.duration_us).toBeGreaterThanOrEqual(8_000);
 
       await vi.waitFor(() => expect(events(transport).length).toBeGreaterThan(0));
-      const errorEvent = events(transport).find((e) => e.type === 'error')!;
-      expect(errorEvent).toBeDefined();
+      const errorEvents = events(transport).filter((e) => e.type === 'error');
+      expect(errorEvents).toHaveLength(1);
+      const errorEvent = errorEvents[0]!;
       expect(errorEvent.message).toBe('deadlock victim');
       const db = (errorEvent.context as { db?: { system?: string; duration_ms?: number } } | undefined)?.db;
       expect(db?.system).toBe('prisma');

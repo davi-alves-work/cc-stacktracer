@@ -16,6 +16,12 @@ export type BaseEnvelope = {
   /** Duplicates `service.environment` for backward compatibility with string-only legacy envelopes. */
   environment: string;
   timestamp: string;
+  /**
+   * Chave de idempotência (UUID), atribuída UMA vez quando o evento entra na fila. Vai para o `event_id`
+   * do fio e se repete em todo retry — antes era sorteada na normalização, a cada tentativa, e um reenvio
+   * de algo já aceito virava um segundo evento que nenhum dedupe por `event_id` enxergava.
+   */
+  eventId?: string;
   context?: Record<string, unknown>;
 };
 

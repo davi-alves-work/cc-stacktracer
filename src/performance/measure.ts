@@ -1,5 +1,4 @@
-import { buildErrorEvent } from '../capture/build-error-event.js';
-import { getSdkRuntime } from '../core/client-ref.js';
+import { annotateError, captureErrorOnce, isErrorTracked } from '../core/error-tracking.js';
 import { isTelemetryActive, safeRun } from '../core/safe-run.js';
 import { beginOutboundSpan, endOutboundSpan, withSpan, type SpanOptions } from '../core/tracing.js';
 import { extractSqlVerb } from './sql-verb.js';
@@ -31,7 +30,11 @@ export type RunQueryOptions = {
   sql?: string;
   /** Explicit SQL verb (e.g. `UPDATE`) when `sql` is not available. */
   sqlVerb?: string;
-  /** When false, failures are not auto-enqueued as error events (use when the app captures at the HTTP boundary). Default true. */
+  /**
+   * When false, `runQuery` sends no error event of its own. Inside a trace the event belongs to Error Tracking
+   * anyway (one per request/job), so this only matters outside a trace or with `errorTracking: false`.
+   * Default true.
+   */
   captureError?: boolean;
   /**
    * When true, the span is a leaf — it never becomes the parent of spans started while the query
@@ -48,7 +51,8 @@ export type RunQueryOptions = {
 
 function kindToSpanType(kind: MeasureKind): 'db' | 'http' | 'external' | 'business' {
   if (kind === 'db') return 'db';
-  if (kind === 'http') return 'http';
+  // Medir uma chamada HTTP e medir uma chamada de SAIDA: `external`, nunca o `http` da requisicao recebida.
+  if (kind === 'http') return 'external';
   if (kind === 'queue') return 'external';
   return 'business';
 }
@@ -78,40 +82,57 @@ function measureSpanOptions(operation: string, options: MeasureOptions | undefin
   return { type: kindToSpanType(kind), attributes };
 }
 
-function captureMeasureError(
+function measureErrorContext(
   operation: string,
   options: MeasureOptions | undefined,
   start: number,
-  err: unknown,
-): void {
-  const { client, initConfig } = getSdkRuntime();
-  if (!client || !initConfig) return;
+): Record<string, unknown> {
   const duration_ms = Math.round(performance.now() - start);
   const kind = options?.kind ?? 'internal';
-  const perf = kind === 'db' ? {} : { performance: { operation, duration_ms, failed: true, kind } };
-  const dbCtx =
-    kind === 'db'
-      ? {
-          db: {
-            system: options?.dbSystem ?? 'unknown',
-            operation: options?.dbSqlVerb ?? extractSqlVerb(options?.dbSql) ?? operation,
-            ...(options?.dbTable !== undefined ? { table: options.dbTable } : {}),
-            duration_ms,
-          },
-        }
-      : {};
-  client.enqueue(
-    buildErrorEvent({
-      service: initConfig.service,
-      environment: initConfig.environment,
-      error: asError(err),
-      context: { ...dbCtx, ...perf },
-    }),
-  );
+  if (kind !== 'db') return { performance: { operation, duration_ms, failed: true, kind } };
+  return {
+    db: {
+      system: options?.dbSystem ?? 'unknown',
+      operation: options?.dbSqlVerb ?? extractSqlVerb(options?.dbSql) ?? operation,
+      ...(options?.dbTable !== undefined ? { table: options.dbTable } : {}),
+      duration_ms,
+    },
+  };
 }
 
 /**
- * Runs `fn`, records duration as a **span** (no success log). On failure, captures an error event and rethrows.
+ * O erro leva o contexto da operacao ANTES de o span fechar: numa raiz ja fechada o Error Tracking envia
+ * na hora, e o bloco `db`/`performance` precisa ja estar la.
+ */
+function annotateThrown(err: unknown, context: () => Record<string, unknown>): void {
+  if (err instanceof Error) safeRun('annotateError', () => annotateError(err, context()));
+}
+
+function annotated<T>(fn: () => Promise<T> | T, context: () => Record<string, unknown>): () => Promise<T> {
+  return async () => {
+    try {
+      return await fn();
+    } catch (err) {
+      annotateThrown(err, context);
+      throw err;
+    }
+  };
+}
+
+/**
+ * Dentro de um trace o erro e do Error Tracking — um evento por requisicao/job, o do span mais alto. Evento
+ * proprio so sem trace ou com o Error Tracking desligado, como na 2.x.
+ */
+function captureUntrackedError(err: unknown, context: Record<string, unknown>): void {
+  const error = asError(err);
+  if (isErrorTracked(error)) return;
+  captureErrorOnce(error, context);
+}
+
+/**
+ * Runs `fn`, records duration as a **span** (no success log). On failure, the error reaches `/errors` once —
+ * through Error Tracking inside a trace, directly otherwise — carrying a `performance` (or `db`) block, and
+ * is rethrown.
  */
 export async function measure<T>(operation: string, fn: () => Promise<T> | T, options?: MeasureOptions): Promise<T> {
   const start = performance.now();
@@ -119,11 +140,12 @@ export async function measure<T>(operation: string, fn: () => Promise<T> | T, op
     options?.silent === true || !isTelemetryActive()
       ? undefined
       : safeRun('measure.setup', () => measureSpanOptions(operation, options));
+  const errorContext = (): Record<string, unknown> => measureErrorContext(operation, options, start);
   let out: Awaited<T>;
   try {
-    out = spanOptions === undefined ? await fn() : await withSpan(operation, fn, spanOptions);
+    out = spanOptions === undefined ? await fn() : await withSpan(operation, annotated(fn, errorContext), spanOptions);
   } catch (err) {
-    safeRun('measure.captureError', () => captureMeasureError(operation, options, start, err));
+    safeRun('measure.captureError', () => captureUntrackedError(err, errorContext()));
     throw err;
   }
   return out;
@@ -144,36 +166,31 @@ function queryTelemetry(dbSystem: string, operationName: string, options: RunQue
   };
 }
 
-function captureQueryError(
+function queryErrorContext(
   dbSystem: string,
   query: QueryTelemetry,
   options: RunQueryOptions | undefined,
   start: number,
-  err: unknown,
-): void {
+): Record<string, unknown> {
+  return {
+    db: {
+      system: dbSystem,
+      operation: query.dbOperation,
+      ...(options?.table !== undefined ? { table: options.table } : {}),
+      duration_ms: Math.round(performance.now() - start),
+    },
+  };
+}
+
+function captureQueryError(err: unknown, options: RunQueryOptions | undefined, context: Record<string, unknown>): void {
   if (options?.captureError === false) return;
-  const { client, initConfig } = getSdkRuntime();
-  if (!client || !initConfig) return;
-  client.enqueue(
-    buildErrorEvent({
-      service: initConfig.service,
-      environment: initConfig.environment,
-      error: asError(err),
-      context: {
-        db: {
-          system: dbSystem,
-          operation: query.dbOperation,
-          ...(options?.table !== undefined ? { table: options.table } : {}),
-          duration_ms: Math.round(performance.now() - start),
-        },
-      },
-    }),
-  );
+  captureUntrackedError(err, context);
 }
 
 /**
  * Database work: records a **db** span (duration + system / operation / table when provided).
- * On failure, emits an error event (same as legacy `measure` + `db` kind).
+ * On failure, the error reaches `/errors` once — through Error Tracking inside a trace, directly otherwise —
+ * carrying a `db` block, and is rethrown.
  *
  * O `try` envolve SÓ a query: se o span fosse emitido dentro dele e lançasse depois do commit, o
  * `catch` relançaria o erro do SDK e a app faria retry de um INSERT que já aconteceu.
@@ -191,12 +208,13 @@ export async function runQuery<T>(
   if (query === undefined) {
     return fn();
   }
+  const errorContext = (): Record<string, unknown> => queryErrorContext(dbSystem, query, options, start);
   if (options?.leaf !== true) {
     let nested: Awaited<T>;
     try {
-      nested = await withSpan(operationName, fn, { type: 'db', attributes: query.attributes });
+      nested = await withSpan(operationName, annotated(fn, errorContext), { type: 'db', attributes: query.attributes });
     } catch (err) {
-      safeRun('runQuery.captureError', () => captureQueryError(dbSystem, query, options, start, err));
+      safeRun('runQuery.captureError', () => captureQueryError(err, options, errorContext()));
       throw err;
     }
     return nested;
@@ -206,12 +224,13 @@ export async function runQuery<T>(
   try {
     out = await fn();
   } catch (err) {
+    annotateThrown(err, errorContext);
     safeRun('runQuery.end', () => {
       if (leafSpan !== null) {
         endOutboundSpan(leafSpan, { name: operationName, type: 'db', attributes: query.attributes, err: asError(err) });
       }
     });
-    safeRun('runQuery.captureError', () => captureQueryError(dbSystem, query, options, start, err));
+    safeRun('runQuery.captureError', () => captureQueryError(err, options, errorContext()));
     throw err;
   }
   if (leafSpan !== null) {

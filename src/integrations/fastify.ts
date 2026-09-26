@@ -11,7 +11,7 @@ import { extractCorrelationFromHeaders } from '../utils/correlation.js';
 import { redactHeaders } from '../utils/redact-headers.js';
 import { headersToRecord } from '../utils/headers.js';
 import { redactUrl } from '../utils/redact-url.js';
-import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
+import { maskDynamicRouteSegments, normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { httpRootSpanOutcome } from './http-root-span-outcome.js';
 import { completeLocalRoot, recordBoundaryError } from '../core/error-tracking.js';
 import { warnRemovedCaptureErrors } from './removed-options.js';
@@ -72,26 +72,17 @@ function emitRootSpan(
     snap.statusCode = reply.statusCode;
   }
 
-  const route =
-    typeof req.routerPath === 'string' && req.routerPath !== '' ? req.routerPath : request.routeOptions?.url;
+  const route = fastifyRouteTemplate(req);
 
-  if (
-    !client.shouldCaptureHttpRequest({
-      endpoint: typeof route === 'string' ? route : request.url,
-      status_code: reply.statusCode,
-    })
-  ) {
-    // Capture policy says skip — record the decision so the fallback does not retry.
-    req[EMITTED_KEY] = true;
-    return;
-  }
-
+  // A politica de captura e decidida UMA vez, em `enqueueSpan` (pela chave do trace). Avaliar aqui tambem
+  // sorteava duas vezes o mesmo span: `sampleRate` 0,5 virava 0,25.
   req[EMITTED_KEY] = true;
 
   const startMs = req[START_TIME_KEY];
   const endMs = Date.now();
   const durationMs = startMs !== undefined ? endMs - startMs : 0;
-  const pathOnly = request.url.split('?')[0] ?? request.url;
+  // Sem rota casada (404, scanner): o path com os ids mascarados. Cru, cada id virava uma rota.
+  const pathOnly = maskDynamicRouteSegments(request.url.split('?')[0] ?? request.url);
   const startIso = startMs !== undefined ? new Date(startMs).toISOString() : new Date(endMs - durationMs).toISOString();
   const endIso = new Date(endMs).toISOString();
   const routeLabel = typeof route === 'string' && route !== '' ? route : pathOnly;
@@ -116,6 +107,12 @@ function emitRootSpan(
   });
 }
 
+/** Template da rota casada; `undefined` quando nenhuma rota casou (404). */
+function fastifyRouteTemplate(req: TracedRequest): string | undefined {
+  const route = typeof req.routerPath === 'string' && req.routerPath !== '' ? req.routerPath : req.routeOptions?.url;
+  return typeof route === 'string' && route !== '' ? route : undefined;
+}
+
 type RequestTelemetry = {
   snapshot: HttpRequestSnapshot;
   traceId: string;
@@ -127,12 +124,13 @@ type RequestTelemetry = {
 function prepareRequest(request: FastifyRequest, client: StackTraceClient | null): RequestTelemetry {
   const raw = headersToRecord(request.headers);
   const headers = redactHeaders(raw, { maxValueLength: 512, ...client?.getHeaderRedactionOptions() });
+  const req = request as TracedRequest;
   const snapshot: HttpRequestSnapshot = {
     method: request.method,
     url: redactUrl(request.url, client?.getUrlRedactionOptions()),
     headers,
+    route: () => fastifyRouteTemplate(req),
   };
-  const req = request as TracedRequest;
   req[START_TIME_KEY] = Date.now();
   const correlation = extractCorrelationFromHeaders(raw);
   const traceId = correlation.traceId ?? randomBytes(16).toString('hex');

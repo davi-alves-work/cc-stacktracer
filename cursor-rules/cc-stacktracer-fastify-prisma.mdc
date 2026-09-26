@@ -197,13 +197,16 @@ All durations must be rounded to integers before span ingest.
 
 ## 6) Error Capture Boundary
 
-Use one app monitor pipeline.
+Since SDK 3.0 the Fastify plugin sees the exception (`onError`) and, when the response is a server
+error status (default `500-599`), sends it as ONE error event linked to the root HTTP span. No
+`captureException` is required for that; an exception the handler turns into a 4xx is not an error.
 
 Recommended flow:
 
-1. Fastify global error handler maps exceptions to safe HTTP responses.
-2. Error logger/monitor builds internal context.
-3. Monitor transport calls `StackTrace.captureException`.
+1. Fastify global error handler maps exceptions to safe HTTP responses — the status decides.
+2. The SDK sends the error event automatically.
+3. Optionally, the error logger/monitor calls `StackTrace.captureException(error, context)` with the
+   same error object to add diagnostic context — still one event.
 4. `beforeSend` normalizes HTTP context.
 
 The monitor context should include safe fields only:
@@ -220,11 +223,11 @@ The monitor context should include safe fields only:
 
 Never return stack traces, SQL, table/column details, tokens, or connection strings to the browser.
 
-Duplicate captures:
+One event per failure (SDK 3.0.1+):
 
-- `runQuery` failures may create SDK DB error events
-- the Fastify error boundary may also capture the same request failure
-- document this behavior and use `errorId`, trace IDs, or dashboard grouping to distinguish it
+- a `runQuery` failure that reaches the Fastify boundary as a 5xx is one error event — on the root span, carrying the query's `db` block
+- a `captureException` in the error handler on the same error object does not add another
+- a failure handled without rethrowing (the request ends 2xx/4xx) is still one event, on the query span
 
 ---
 
@@ -478,7 +481,7 @@ Full JSONL payload logging is allowed in development only and must be opt-in.
 
 1. Verify global error handler calls monitor/logger.
 2. Verify monitor extracts `x-request-id` and `traceparent`.
-3. Verify monitor transport forwards correlation into `StackTrace.captureException`.
+3. If the monitor calls `StackTrace.captureException`, verify it runs inside the request context (the error handler does).
 4. Verify `beforeSend` folds monitor HTTP context into `context.http`.
 
 ---

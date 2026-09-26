@@ -1,11 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setSdkRuntime } from '../core/client-ref.js';
 import { parseStackTraceInit } from '../core/config.schema.js';
-import { StackTraceClient } from '../core/stacktrace-client.js';
+import { StackTraceClient, type BatchTransportPayload } from '../core/stacktrace-client.js';
+import type { StackTraceEvent } from '../core/stacktrace-event.types.js';
+import { resetErrorTrackingState } from '../core/error-tracking.js';
+import { withTrace } from '../core/tracing.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
 import { extractSqlVerb, measure, runQuery } from './measure.js';
-import { getStackTraceClient, init, shutdown } from '../index.js';
+import { captureException, flush, getStackTraceClient, init, shutdown } from '../index.js';
 
 describe('extractSqlVerb', () => {
   it('parses common SQL verbs', () => {
@@ -214,5 +217,146 @@ describe('measure / runQuery fail-open', () => {
       await expect(runQuery('postgres', 'orders.insert', fn)).resolves.toBe(1);
     });
     expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('runQuery / measure com Error Tracking: um erro vira UM evento', () => {
+  beforeEach(() => resetErrorTrackingState());
+  afterEach(async () => {
+    await shutdown();
+  });
+
+  function initCollecting(extra: { errorTracking?: boolean } = {}): ReturnType<typeof vi.fn> {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    init({
+      apiKey: 'k',
+      serviceId: '11111111-1111-4111-8111-111111111111',
+      endpoint: 'https://ingest.example.com',
+      sendMode: 'immediate',
+      transport,
+      ...extra,
+    });
+    return transport;
+  }
+
+  async function errorEvents(transport: ReturnType<typeof vi.fn>): Promise<StackTraceEvent[]> {
+    await flush();
+    return transport.mock.calls
+      .map((call) => call[0] as BatchTransportPayload)
+      .flatMap((payload) => (payload.kind === 'batch' ? payload.events : []))
+      .filter((event) => event.type === 'error');
+  }
+
+  const failingQuery = async (): Promise<never> => {
+    throw new Error('db down');
+  };
+
+  it('query que falha dentro de withTrace: UM evento, do Error Tracking, com o bloco db', async () => {
+    const transport = initCollecting();
+    await expect(
+      withTrace('job.reprocess', () => runQuery('postgres', 'User.find', failingQuery, { table: 'users' })),
+    ).rejects.toThrow('db down');
+    const events = await errorEvents(transport);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toMatchObject({
+      captured_by: 'error-tracking',
+      db: { system: 'postgres', operation: 'User.find', table: 'users' },
+    });
+  });
+
+  it('query folha (caminho da extensao do Prisma): UM evento, com o bloco db', async () => {
+    const transport = initCollecting();
+    await expect(
+      withTrace('job.reprocess', () =>
+        runQuery('prisma', 'User.findMany', failingQuery, { table: 'User', sqlVerb: 'findMany', leaf: true }),
+      ),
+    ).rejects.toThrow('db down');
+    const events = await errorEvents(transport);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toMatchObject({
+      captured_by: 'error-tracking',
+      db: { system: 'prisma', operation: 'findMany', table: 'User' },
+    });
+  });
+
+  it('measure que falha dentro de withTrace: UM evento, com o bloco performance', async () => {
+    const transport = initCollecting();
+    await expect(
+      withTrace('job.reprocess', () =>
+        measure('billing.charge', () => {
+          throw new Error('declined');
+        }),
+      ),
+    ).rejects.toThrow('declined');
+    const events = await errorEvents(transport);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toMatchObject({
+      captured_by: 'error-tracking',
+      performance: { operation: 'billing.charge', failed: true },
+    });
+  });
+
+  it('captureException no handler depois de a query relancar: UM evento, com o contexto do handler e o db', async () => {
+    const transport = initCollecting();
+    await expect(
+      withTrace('job.reprocess', async () => {
+        try {
+          await runQuery('postgres', 'User.find', failingQuery, { table: 'users' });
+        } catch (err) {
+          captureException(err as Error, { invoiceId: 'inv-1' });
+          throw err;
+        }
+      }),
+    ).rejects.toThrow('db down');
+    const events = await errorEvents(transport);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toMatchObject({ invoiceId: 'inv-1', db: { table: 'users' } });
+  });
+
+  it('query que falha depois de o job terminar: UM evento na hora, ainda com o bloco db', async () => {
+    const transport = initCollecting();
+    let late: Promise<unknown> = Promise.resolve();
+    await withTrace('job.reprocess', async () => {
+      // Disparada e esquecida: termina depois da raiz.
+      late = runQuery(
+        'postgres',
+        'Audit.insert',
+        async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          throw new Error('late');
+        },
+        { table: 'audit' },
+      ).catch(() => undefined);
+    });
+    await late;
+    const events = await errorEvents(transport);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toMatchObject({ captured_by: 'error-tracking', db: { table: 'audit' } });
+  });
+
+  it('fora de trace a query continua emitindo na hora, com o bloco db (como na 2.x)', async () => {
+    const transport = initCollecting();
+    await expect(runQuery('postgres', 'User.find', failingQuery, { table: 'users' })).rejects.toThrow('db down');
+    const events = await errorEvents(transport);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toMatchObject({ db: { table: 'users' } });
+    expect(events[0]?.context?.captured_by).toBeUndefined();
+  });
+
+  it('Error Tracking desligado: a query emite o proprio evento, como na 2.x', async () => {
+    const transport = initCollecting({ errorTracking: false });
+    await expect(
+      withTrace('job.reprocess', () => runQuery('postgres', 'User.find', failingQuery, { table: 'users' })),
+    ).rejects.toThrow('db down');
+    const events = await errorEvents(transport);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toMatchObject({ db: { table: 'users' } });
+    expect(events[0]?.context?.captured_by).toBeUndefined();
+  });
+
+  it('captureError: false fora de trace: nenhum evento', async () => {
+    const transport = initCollecting();
+    await expect(runQuery('postgres', 'User.find', failingQuery, { captureError: false })).rejects.toThrow('db down');
+    expect(await errorEvents(transport)).toHaveLength(0);
   });
 });

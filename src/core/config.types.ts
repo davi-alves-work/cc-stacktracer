@@ -72,6 +72,11 @@ export type StackTraceInitOptions = {
   /**
    * Status que tornam uma requisicao RECEBIDA um erro, no formato do Datadog: codigos ou faixas de 100 a 599
    * separados por virgula. Padrao `"500-599"`. Env: `STACKTRACE_HTTP_SERVER_ERROR_STATUSES`.
+   *
+   * Vale para o SDK: o `status` do span raiz e quais excecoes de borda viram evento de erro. As METRICAS
+   * do painel (taxa de erro, Apdex, alertas) classificam a requisicao pelo status HTTP numa faixa fixa —
+   * 4xx e erro de cliente, 5xx e de servidor — e nao leem esta opcao: incluir `429` aqui cria o evento de
+   * erro, mas o 429 continua contado como erro de cliente no painel.
    */
   httpServerErrorStatuses?: string;
   /**

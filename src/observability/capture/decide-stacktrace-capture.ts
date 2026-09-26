@@ -23,14 +23,17 @@ export function decideStackTraceCapture(
 ): boolean {
   const ctx = event.context;
   const eventType = eventToCaptureType(event);
+  const http = typeof ctx?.http === 'object' && ctx?.http !== null ? (ctx.http as Record<string, unknown>) : undefined;
+  // Mesma chave de endpoint que spans e servidor usam: o template da rota, e o path so na falta dele.
+  // A URL crua (com query) nunca casava regra nenhuma por rota.
   const endpoint =
-    typeof ctx?.http === 'object' && ctx?.http !== null && 'url' in (ctx.http as object)
-      ? String((ctx.http as { url?: string }).url ?? '')
-      : undefined;
-  const rawStatus =
-    typeof ctx?.http === 'object' && ctx?.http !== null
-      ? (ctx.http as { status_code?: unknown }).status_code
-      : undefined;
+    typeof http?.route_template === 'string'
+      ? http.route_template
+      : typeof http?.url === 'string'
+        ? (http.url.split('?')[0] ?? http.url)
+        : undefined;
+  // O contexto do SDK chama de `response_status_code`; `status_code` e o nome no fio (v4).
+  const rawStatus = http?.response_status_code ?? http?.status_code;
   const status_code = typeof rawStatus === 'number' && Number.isFinite(rawStatus) ? rawStatus : undefined;
   const critical =
     (ctx !== undefined && (ctx.critical === true || ctx.capture_critical === true)) ||

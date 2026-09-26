@@ -1,5 +1,6 @@
 import {
   evaluateCapture,
+  samplingRandomForKey,
   spanRowToCaptureEventType,
   type CaptureEvaluationContext,
   type CaptureEventType,
@@ -41,6 +42,15 @@ export class CaptureGate {
 
   constructor(private readonly opts: CaptureGateOptions) {
     this.rng = opts.random ?? Math.random;
+  }
+
+  /**
+   * Sorte derivada da chave (trace/evento), a mesma que o servidor usa — ver `samplingValueForKey`. Um
+   * `random` injetado (testes) continua valendo; sem chave, cai no aleatorio.
+   */
+  private rngFor(key: string | null | undefined): () => number {
+    if (this.opts.random !== undefined) return this.opts.random;
+    return samplingRandomForKey(key) ?? this.rng;
   }
 
   shouldCapture(eventType: CaptureEventType, context: CaptureContext = {}): boolean {
@@ -109,14 +119,18 @@ export class CaptureGate {
           ? { status_code: row.http_status_code }
           : {}),
         ...(critical ? { critical: true } : {}),
+        // Sem isto, regra com `minDurationMs` nunca casava no SDK.
+        duration_ms: Math.round(row.duration_us / 1000),
       },
-      { random: this.rng },
+      { random: this.rngFor(row.trace_id) },
     );
   }
 
   shouldCaptureStackTraceEvent(event: StackTraceEvent): boolean {
     const key = buildCapturePolicyServiceIdKey(this.opts.defaultServiceId);
     const compiled = this.opts.cache.getPolicy(key);
-    return decideStackTraceCapture(event, compiled, this.rng);
+    const trace = event.context?.trace as { trace_id?: unknown } | undefined;
+    const traceId = typeof trace?.trace_id === 'string' ? trace.trace_id : undefined;
+    return decideStackTraceCapture(event, compiled, this.rngFor(traceId ?? event.eventId));
   }
 }

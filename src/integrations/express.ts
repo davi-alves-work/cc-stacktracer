@@ -9,7 +9,7 @@ import { extractCorrelationFromHeaders } from '../utils/correlation.js';
 import { redactHeaders } from '../utils/redact-headers.js';
 import { headersToRecord } from '../utils/headers.js';
 import { redactUrl } from '../utils/redact-url.js';
-import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
+import { maskDynamicRouteSegments, normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { httpRootSpanOutcome } from './http-root-span-outcome.js';
 import { completeLocalRoot, recordBoundaryError } from '../core/error-tracking.js';
 import { warnRemovedCaptureErrors } from './removed-options.js';
@@ -51,10 +51,13 @@ function prepareRequest(req: Request, res: Response, client: StackTraceClient | 
     method: req.method,
     url: redactUrl(rawUrl, client?.getUrlRedactionOptions()),
     headers,
+    // O template so existe depois do roteamento: lido quando o evento sai.
+    route: () => expressMatchedRoute(req),
   };
   const traceId = correlation.traceId ?? randomBytes(16).toString('hex');
   const rootSpanId = randomBytes(8).toString('hex');
-  const pathOnly = (req.originalUrl ?? req.url).split('?')[0] ?? req.url;
+  // Sem rota casada (401 de middleware global, 404): path com ids mascarados, nunca cru.
+  const pathOnly = maskDynamicRouteSegments((req.originalUrl ?? req.url).split('?')[0] ?? req.url);
 
   // Emit the root span exactly once, however the request ends. `finish` covers a
   // completed response; `close` is the fallback for aborted/timed-out connections

@@ -6,7 +6,7 @@ import type { StackTraceClient } from '../core/stacktrace-client.js';
 import { getStackTraceClient } from '../index.js';
 import { runWithTraceContext } from '../core/trace-span-context.js';
 import { extractCorrelationFromHeaders } from '../utils/correlation.js';
-import { normalizeHttpRouteForSpan } from '../shared/schema/index.js';
+import { maskDynamicRouteSegments, normalizeHttpRouteForSpan } from '../shared/schema/index.js';
 import { redactHeaders } from '../utils/redact-headers.js';
 import { redactUrl } from '../utils/redact-url.js';
 import { httpRootSpanOutcome } from './http-root-span-outcome.js';
@@ -64,7 +64,15 @@ function prepareRequest(ctx: AdonisHttpContextLike, opts: StacktraceAdonisOption
   const client = getClient(opts);
   const correlation = extractCorrelationFromHeaders(rawHeaders);
   const headers = redactHeaders(rawHeaders, { maxValueLength: 512, ...client?.getHeaderRedactionOptions() });
-  const snapshot: HttpRequestSnapshot = { method, url: redactUrl(url, client?.getUrlRedactionOptions()), headers };
+  const snapshot: HttpRequestSnapshot = {
+    method,
+    url: redactUrl(url, client?.getUrlRedactionOptions()),
+    headers,
+    route: () => {
+      const pattern = ctx.route?.pattern;
+      return typeof pattern === 'string' && pattern.trim() !== '' ? pattern : undefined;
+    },
+  };
   const raw = ctx.response.getResponse();
   const emitHttpRootSpan = opts?.emitHttpRootSpan !== false;
   const traceId = correlation.traceId ?? randomBytes(16).toString('hex');
@@ -90,13 +98,10 @@ function prepareRequest(ctx: AdonisHttpContextLike, opts: StacktraceAdonisOption
     if (!client) return;
     const durationMs = Date.now() - start;
     snapshot.statusCode = statusCode;
-    const pathOnly = url.split('?')[0] ?? url;
+    // Sem rota casada: path com ids mascarados, nunca cru.
+    const pathOnly = maskDynamicRouteSegments(url.split('?')[0] ?? url);
     const routePattern = ctx.route?.pattern;
-    const endpoint = typeof routePattern === 'string' && routePattern.trim() !== '' ? routePattern : pathOnly;
-
-    if (!client.shouldCaptureHttpRequest({ endpoint, status_code: statusCode })) {
-      return;
-    }
+    // Politica de captura: decidida uma vez so, em `enqueueSpan` (ver fastify.ts).
     if (!emitHttpRootSpan) {
       return;
     }

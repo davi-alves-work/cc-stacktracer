@@ -4,6 +4,54 @@ All notable changes to the `cc-stacktracer` SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-09-26
+
+Data integrity: what the SDK sends is what the dashboard shows — once, whole, in the right place.
+Includes the 3.0.1 fixes, which were never published on their own.
+
+### Fixed
+
+- **Concurrent spans were nested under each other.** Two `withSpan` calls in `Promise.all` shared one
+  mutable span stack: the second became a child of the first, ending one popped the other, and later
+  spans (and the logs/errors inside them) pointed at a span that had already ended. Each `withSpan`
+  now runs in its own scope; `startSpan` leaves the stack by its own id.
+- **One bad event took the whole batch down.** An empty or `null` context value, an error message over
+  16,000 characters, a user agent over 2,048… failed validation for the whole batch, which was retried
+  for ~4 minutes (blocking the queue) and then dropped with its valid events. Fields over the contract
+  limits are now cut to the limit, empty tags are omitted, and each event is normalized on its own. Span
+  rows are fitted to the span contract (a 2 KB `withSpan` name or a status of 999 no longer loses the
+  batch), and batches never exceed what the server accepts (100 events / 500 spans).
+- **Retries created duplicates.** `event_id` was drawn again on every delivery attempt, so a resend
+  after a timeout was stored as a new event. It is now assigned once, when the event is queued
+  (`eventId`), and repeated on every retry.
+- **Error Tracking events carried `status_code: 0`.** An exception from a child span now carries the
+  request's final status, and the event keeps the time the exception happened, not the time the request
+  ended.
+- **`http.route` is the route template, without the method.** It used to be `"GET /users/:id"` derived
+  from the URL even when the framework knew the template. Unmatched routes (404, 401 from a global
+  middleware) are recorded with ids masked, and UUID v7, ObjectId and ULID segments are now masked too.
+- **`measure(..., { kind: 'http' })` and child spans typed `http`** are recorded as `external` (an
+  outbound call), no longer counted as incoming requests.
+- **Sampling compounded.** With `capturePolicyRefreshMs`, the root HTTP span was sampled twice in the SDK
+  and again on the server (`sampleRate: 0.5` kept 12.5%). Sampling is now a deterministic function of the
+  trace id (or the event id without a trace): the SDK and the server agree, and a trace is kept or
+  dropped whole. Rules with `minDurationMs` now match in the SDK; event rules match on the route and see
+  the response status.
+- **`sendMode: 'immediate'`**: `flush()` and `shutdown()` now wait for in-flight sends.
+- **`runtime` reaches the server** (`node_version`, `platform`, `arch`); `logStructured`'s `operation` and
+  `duration_ms` arrive as `performance.*` tags; the "dropped context key runtime/resource" warnings on
+  every event are gone, and `release` is no longer duplicated as a tag.
+- (3.0.1) **A failed `runQuery` or `measure` sent two error events** inside a request or `withTrace` job.
+  Now Error Tracking sends it once, still carrying the `db` (or `performance`) block.
+- (3.0.1) **`setUser()` never reached the wire.** It now arrives as `metadata.user` (`id`,
+  `end_user_tenant`, `email_hash`).
+
+### Server
+
+The fixes are complete with a platform that accepts batch items one by one (`rejectedIndexes`),
+deduplicates by `event_id` / `trace_id:span_id`, and samples by the same key. Older platforms keep
+working with this SDK; newer platforms keep working with older SDKs.
+
 ## [3.0.0] - 2026-09-26
 
 Errors now follow the Datadog model: they are captured automatically, a request is an error only on a

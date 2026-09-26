@@ -1,4 +1,3 @@
-import { buildErrorEvent } from './capture/build-error-event.js';
 import { buildLogEvent } from './capture/build-log-event.js';
 import { setSdkRuntime, getSdkRuntime } from './core/client-ref.js';
 import { resetFailOpenState, safeRun, safeRunAsync, setInternalFailureSink } from './core/safe-run.js';
@@ -6,7 +5,7 @@ import { parseStackTraceInit, type ParsedStackTraceInit } from './core/config.sc
 import { buildInternalFailureSink, reportInvalidConfig } from './core/init-diagnostics.js';
 import { isSdkDisabledByEnv } from './core/kill-switch.js';
 import { resolveErrorTrackingConfig } from './core/error-tracking-config.js';
-import { isErrorCaptured, markErrorCaptured } from './core/error-tracking.js';
+import { captureErrorOnce } from './core/error-tracking.js';
 import type { StackTraceAutoOptions, StackTraceInitOptions } from './core/config.types.js';
 import type { StackTracePlugin } from './core/plugins/types.js';
 import {
@@ -106,7 +105,7 @@ function startClient(parsed: ParsedStackTraceInit): void {
   setInternalFailureSink(buildInternalFailureSink(parsed));
   if (parsed.enableGlobalHandlers) {
     registerGlobalHandlers({
-      captureException: (err) => enqueueErrorOnce(err),
+      captureException: (err) => captureErrorOnce(err),
       flush: () => {
         const { client } = getSdkRuntime();
         return client ? client.flush() : Promise.resolve();
@@ -115,27 +114,8 @@ function startClient(parsed: ParsedStackTraceInit): void {
   }
 }
 
-/**
- * Um objeto de erro vira no maximo UM evento, venha de onde vier: `captureException` manual, o Error
- * Tracking automatico ou o handler global. Quem ja chamava `captureException` no error handler e relancava
- * nao passa a contar em dobro com a captura automatica da 3.0.
- */
-function enqueueErrorOnce(error: Error, context?: Record<string, unknown>): void {
-  const { client, initConfig } = getSdkRuntime();
-  if (!client || !initConfig || isErrorCaptured(error)) return;
-  markErrorCaptured(error);
-  client.enqueue(
-    buildErrorEvent({
-      service: initConfig.service,
-      environment: initConfig.environment,
-      error,
-      ...(context !== undefined ? { context } : {}),
-    }),
-  );
-}
-
 export function captureException(error: Error, context?: Record<string, unknown>): void {
-  safeRun('captureException', () => enqueueErrorOnce(error, context));
+  safeRun('captureException', () => captureErrorOnce(error, context));
 }
 
 export function log(message: string, metadata?: Record<string, unknown>): void {

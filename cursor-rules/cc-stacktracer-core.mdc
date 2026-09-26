@@ -772,14 +772,25 @@ For raw SQL:
 
 ## 11) Error Capture Boundary
 
-Keep one canonical application error pipeline.
+Since SDK 3.0 errors are captured automatically, following Datadog:
+
+- an exception that reaches the HTTP integration and ends in a server error status (default
+  `500-599`, `httpServerErrorStatuses`) becomes ONE error event, on the root HTTP span
+- an exception recorded on a span — `withTrace`, `withSpan`, `runQuery`, a network failure on an
+  outbound call — becomes an event too; per request or job only the top-most one is sent
+- the same error object becomes at most one event, whichever path sends it (automatic capture,
+  `captureException`, global handlers)
+- `init({ errorTracking: false })` / `STACKTRACE_ERROR_TRACKING_ENABLED=false` turns it off
 
 Recommended pattern:
 
 1. Domain/repository code throws real errors.
-2. Framework error handler maps user-facing responses.
-3. Internal monitor captures sanitized diagnostic context.
-4. A single cc-stacktracer monitor transport calls `StackTrace.captureException`.
+2. Framework error handler maps user-facing responses — the status decides (5xx is an error, 4xx is not).
+3. The SDK sends the error event; no `captureException` is required for it.
+4. To add sanitized diagnostic context, the handler may call `StackTrace.captureException(error, context)`
+   with the same error object — still one event.
+5. Errors the application catches and handles without rethrowing are not captured automatically:
+   call `StackTrace.captureException` for the ones that matter.
 
 Rules:
 
@@ -792,18 +803,18 @@ Rules:
 - include safe context: error ID, route, method, duration, tenant/project/client identifiers when safe
 - for DB-originated failures, the error event and failed span must expose the sanitized database-returned error message/stack in `message` and `stack`, with usernames, passwords, IP addresses, and other sensitive fragments removed or masked
 - avoid duplicate captures for the same failure unless intentional
-- document known duplicate paths, such as DB `runQuery` failure plus HTTP boundary capture
+- rely on the SDK's one-event-per-error rule (3.0.1+): a `runQuery` failure plus a `captureException` at the HTTP boundary on the same error object is one event, not two
 - make transport registration idempotent
 
-Example:
+Example — a failure handled here and never rethrown, so it is not captured automatically:
 
 ```ts
 try {
-  await operation();
+  await chargeCard(order);
 } catch (err) {
   const error = err instanceof Error ? err : new Error(String(err));
-  StackTrace.captureException(error, { operation: 'orders.create' });
-  throw error;
+  StackTrace.captureException(error, { operation: 'orders.charge', orderId: order.id });
+  return { status: 'payment_pending' };
 }
 ```
 
@@ -901,7 +912,7 @@ Validate:
 
 ### Duplicate errors appear
 
-1. Check `runQuery` error capture plus global HTTP error capture.
+1. Check the SDK version: before 3.0.1, a failed `runQuery` inside a request or job produced two events.
 2. Check duplicate monitor transport registration.
 3. Keep one primary boundary and document exceptions.
 

@@ -9,6 +9,7 @@ import {
   getTraceSpanState,
   popActiveSpan,
   pushActiveSpan,
+  runWithChildSpan,
   runWithTraceContext,
 } from './trace-span-context.js';
 import { getBusinessContext } from './business-context.js';
@@ -119,7 +120,12 @@ function buildRow(params: {
   }
 
   const attrs = mergeBusinessAttributes(params.options?.attributes);
-  const spanType = params.options?.type ?? 'business';
+  // `http` e o span de SERVIDOR — o que as metricas contam como requisicao recebida. Um span filho com
+  // type 'http' (`withSpan(..., { type: 'http' })`, `measure(..., { kind: 'http' })`) e trabalho feito
+  // DENTRO da requisicao, em geral uma chamada de saida: contado como requisicao, inflava throughput,
+  // p95 e Apdex e criava rotas falsas com o nome da operacao.
+  const requestedType = params.options?.type ?? 'business';
+  const spanType = requestedType === 'http' && params.parentSpanId !== null ? 'external' : requestedType;
   const roundedDurationUs = Math.max(0, Math.round(params.durationUs));
   const dbDurMsAttr = numAttr(attrs, 'db_duration_ms');
   const dbDurAttr =
@@ -166,59 +172,59 @@ function buildRow(params: {
 
 type ChildSpanStart = { spanId: string; parentSpanId: string | null; startIso: string; perfStart: number };
 
-/** `undefined` sem trace ativo. O push vem por último: se algo antes lançar, a pilha fica intacta. */
+/** `undefined` sem trace ativo. Não mexe na pilha: quem abre o escopo decide como (withSpan/startSpan). */
 function beginChildSpan(): ChildSpanStart | undefined {
   if (getTraceIdFromContext() === undefined) {
     return undefined;
   }
-  const start: ChildSpanStart = {
+  return {
     spanId: newSpanId(),
     parentSpanId: currentParentSpanIdForChild() ?? null,
     startIso: new Date().toISOString(),
     perfStart: performance.now(),
   };
-  pushActiveSpan(start.spanId);
-  return start;
 }
 
-function finishChildSpan(start: ChildSpanStart, name: string, options: SpanOptions | undefined, err?: Error): void {
-  try {
-    const row = buildRow({
-      name,
-      spanId: start.spanId,
-      parentSpanId: start.parentSpanId,
-      startIso: start.startIso,
-      endIso: new Date().toISOString(),
-      durationUs: (performance.now() - start.perfStart) * 1000,
-      ...(options !== undefined ? { options } : {}),
-      ...(err !== undefined ? { err } : {}),
-    });
-    if (row !== null) {
-      getSdkRuntime().client?.enqueueSpan(row);
-    }
-  } finally {
-    popActiveSpan();
+/** Emite a linha do span. Chamado com o span ainda no escopo, para `spanDepth` o enxergar na pilha. */
+function emitChildSpan(start: ChildSpanStart, name: string, options: SpanOptions | undefined, err?: Error): void {
+  const row = buildRow({
+    name,
+    spanId: start.spanId,
+    parentSpanId: start.parentSpanId,
+    startIso: start.startIso,
+    endIso: new Date().toISOString(),
+    durationUs: (performance.now() - start.perfStart) * 1000,
+    ...(options !== undefined ? { options } : {}),
+    ...(err !== undefined ? { err } : {}),
+  });
+  if (row !== null) {
+    getSdkRuntime().client?.enqueueSpan(row);
   }
 }
 
 /**
  * O `try` envolve SÓ `fn`. Se a telemetria rodasse dentro dele, o `catch` confundiria a falha do SDK
  * com a da app: um `fn` bem-sucedido viraria exceção, e a app faria retry de algo que já aconteceu.
+ *
+ * `fn` roda num escopo PRÓPRIO (cópia da pilha): dois `withSpan` em `Promise.all` são irmãos, não pai e
+ * filho, e o fim de um não tira o outro da pilha.
  */
 export async function withSpan<T>(name: string, fn: () => Promise<T> | T, options?: SpanOptions): Promise<T> {
   const started = isTelemetryActive() ? safeRun('withSpan.start', beginChildSpan) : undefined;
   if (started === undefined) {
     return fn();
   }
-  let out: Awaited<T>;
-  try {
-    out = await fn();
-  } catch (err) {
-    safeRun('withSpan.end', () => finishChildSpan(started, name, options, asError(err)));
-    throw err;
-  }
-  safeRun('withSpan.end', () => finishChildSpan(started, name, options));
-  return out;
+  return runWithChildSpan(started.spanId, async () => {
+    let out: Awaited<T>;
+    try {
+      out = await fn();
+    } catch (err) {
+      safeRun('withSpan.end', () => emitChildSpan(started, name, options, asError(err)));
+      throw err;
+    }
+    safeRun('withSpan.end', () => emitChildSpan(started, name, options));
+    return out;
+  });
 }
 
 type RootSpanStart = { traceId: string; spanId: string; startIso: string; perfStart: number; options: SpanOptions };
@@ -287,8 +293,19 @@ export async function withTrace<T>(name: string, fn: () => Promise<T> | T, optio
   });
 }
 
+/**
+ * Span manual. Sem callback não há escopo a abrir: ele entra na pilha do contexto atual (o que vier
+ * depois, no mesmo fluxo, vira filho dele) e sai dela pelo PRÓPRIO id — nunca pelo topo, que com spans
+ * concorrentes pode ser de outro.
+ */
 export function startSpan(name: string, options?: SpanOptions): SpanHandle {
-  const started = isTelemetryActive() ? safeRun('startSpan.start', beginChildSpan) : undefined;
+  const started = isTelemetryActive()
+    ? safeRun('startSpan.start', () => {
+        const start = beginChildSpan();
+        if (start !== undefined) pushActiveSpan(start.spanId);
+        return start;
+      })
+    : undefined;
   if (started === undefined) {
     return { end: () => {} };
   }
@@ -299,7 +316,13 @@ export function startSpan(name: string, options?: SpanOptions): SpanHandle {
         return;
       }
       ended = true;
-      safeRun('startSpan.end', () => finishChildSpan(started, name, options, err));
+      safeRun('startSpan.end', () => {
+        try {
+          emitChildSpan(started, name, options, err);
+        } finally {
+          popActiveSpan(started.spanId);
+        }
+      });
     },
   };
 }

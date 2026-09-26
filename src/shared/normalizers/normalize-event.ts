@@ -16,6 +16,39 @@ import { maskDynamicRouteSegments, routeHasRawDynamicSegments } from '../schema/
 import { coerceToCanonicalInput, type NormalizeOptions } from '../schema/normalize.js';
 
 /**
+ * Corta no limite do contrato v4. Um campo acima do teto reprovava o evento no `EventSchemaV4.parse` — e,
+ * como a normalização roda sobre o lote, derrubava os outros eventos junto. Cortar preserva o evento.
+ */
+function clip(value: string, max: number): string {
+  return value.length > max ? value.slice(0, max) : value;
+}
+
+/** String cortada; vazia vira `undefined` (o contrato exige `min(1)`). */
+function clipOptional(value: string | undefined, max: number): string | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  return clip(value, max);
+}
+
+const TAG_KEY_MAX = 128;
+const TAG_VALUE_MAX = 1_024;
+
+/** Valor de tag no formato do `TagsSchema`, ou `undefined` quando não cabe (chave vazia/longa, valor vazio). */
+function toTagValue(key: string, value: string): string | undefined {
+  if (key === '' || key.length > TAG_KEY_MAX) return undefined;
+  if (value.trim() === '') return undefined;
+  return clip(value, TAG_VALUE_MAX);
+}
+
+function sanitizeTags(tags: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(tags)) {
+    const safe = toTagValue(k, v);
+    if (safe !== undefined) out[k] = safe;
+  }
+  return out;
+}
+
+/**
  * Prefer a normalized route template when the concrete route still has raw ids (numeric/UUID segments).
  */
 function pathnameFromHttpUrl(url: string): string | undefined {
@@ -65,17 +98,14 @@ function v1HttpToV3(http: CanonicalInput['http'] | undefined): z.infer<typeof Ht
   if (http === undefined) {
     return undefined;
   }
-  const method = http.method ?? 'GET';
-  const route = pickV3HttpRoute(http);
+  const method = clipOptional(http.method, 32) ?? 'GET';
+  const route = clip(pickV3HttpRoute(http), 2048);
   const status_code = http.response_status_code ?? 0;
   const duration_ms = http.duration_ms ?? 0;
-  const scheme = typeof http.scheme === 'string' && http.scheme.trim() !== '' ? http.scheme : undefined;
-  const clientAddress =
-    typeof http.client?.address === 'string' && http.client.address.trim() !== '' ? http.client.address : undefined;
+  const scheme = typeof http.scheme === 'string' ? clipOptional(http.scheme, 32) : undefined;
+  const clientAddress = typeof http.client?.address === 'string' ? clipOptional(http.client.address, 2048) : undefined;
   const userAgent =
-    typeof http['user_agent.original'] === 'string' && http['user_agent.original'].trim() !== ''
-      ? http['user_agent.original']
-      : undefined;
+    typeof http['user_agent.original'] === 'string' ? clipOptional(http['user_agent.original'], 2048) : undefined;
   const hasSignal =
     http.method !== undefined ||
     (http.route !== undefined && http.route.trim() !== '') ||
@@ -92,7 +122,7 @@ function v1HttpToV3(http: CanonicalInput['http'] | undefined): z.infer<typeof Ht
   return HttpSchema.parse({
     method,
     route,
-    ...(http.url !== undefined ? { url: http.url } : {}),
+    ...(http.url !== undefined ? { url: clip(http.url, 8192) } : {}),
     status_code,
     duration_ms,
     ...(scheme !== undefined ? { scheme } : {}),
@@ -116,9 +146,9 @@ function v1DbToV3(db: CanonicalInput['db'] | undefined): z.infer<typeof DbSchema
     return undefined;
   }
   return DbSchema.parse({
-    system: db.system ?? 'unknown',
-    operation: db.operation ?? 'UNKNOWN',
-    table: db.table ?? 'unknown',
+    system: clipOptional(db.system, 128) ?? 'unknown',
+    operation: clipOptional(db.operation, 64) ?? 'UNKNOWN',
+    table: clipOptional(db.table, 256) ?? 'unknown',
     duration_ms: db.duration_ms ?? 0,
     ...(db.statement !== undefined ? { statement: db.statement } : {}),
     ...(db.rows !== undefined ? { rows: db.rows } : {}),
@@ -160,10 +190,10 @@ function v1MetadataToUser(
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
   const rec = raw as Record<string, unknown>;
   // Sem id não há identidade: o evento segue inteiro, só sem o bloco.
-  const id = typeof rec.id === 'string' && rec.id.trim() !== '' ? rec.id : undefined;
+  const id = typeof rec.id === 'string' ? clipOptional(rec.id, 256) : undefined;
   if (id === undefined) return undefined;
-  const endUserTenant = typeof rec.tenantId === 'string' && rec.tenantId.trim() !== '' ? rec.tenantId : undefined;
-  const emailHash = typeof rec.emailHash === 'string' && rec.emailHash.trim() !== '' ? rec.emailHash : undefined;
+  const endUserTenant = typeof rec.tenantId === 'string' ? clipOptional(rec.tenantId, 256) : undefined;
+  const emailHash = typeof rec.emailHash === 'string' ? clipOptional(rec.emailHash, 128) : undefined;
   return {
     id,
     ...(endUserTenant !== undefined ? { end_user_tenant: endUserTenant } : {}),
@@ -178,7 +208,37 @@ function v1MetadataToUser(
  */
 function v1MetadataToSubtenant(meta: Record<string, unknown>): string | undefined {
   const raw = meta.subtenant;
-  return typeof raw === 'string' && raw.trim() !== '' ? raw.trim() : undefined;
+  return typeof raw === 'string' && raw.trim() !== '' ? clip(raw.trim(), 256) : undefined;
+}
+
+/**
+ * O bloco `performance` de `measure`/`logStructured` (`operation`, `duration_ms`, `kind`, `failed`). O
+ * contrato nao tem bloco para ele, e como objeto desconhecido era descartado: `logStructured({ operation,
+ * duration_ms })` nunca levava nenhum dos dois. Vai como tags `performance.<campo>`.
+ */
+function performanceTags(raw: unknown): Record<string, string> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') continue;
+    const safe = toTagValue(`performance.${k}`, String(v));
+    if (safe !== undefined) out[`performance.${k}`] = safe;
+  }
+  return out;
+}
+
+/** `runtime` do SDK (`node`, `platform`, `arch`) no formato do `RuntimeSchema` do contrato. */
+function runtimeBlock(raw: unknown): z.infer<typeof MetadataSchema>['runtime'] | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const nodeVersion =
+    typeof r.node_version === 'string' ? r.node_version : typeof r.node === 'string' ? r.node : undefined;
+  const out = {
+    ...(nodeVersion !== undefined ? { node_version: clip(nodeVersion, 64) } : {}),
+    ...(typeof r.platform === 'string' ? { platform: clip(r.platform, 64) } : {}),
+    ...(typeof r.arch === 'string' ? { arch: clip(r.arch, 32) } : {}),
+  };
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
@@ -195,7 +255,7 @@ function structureMetadataFromV1Event(
   const queue =
     event.queue !== undefined
       ? {
-          ...(event.queue.name !== undefined ? { name: event.queue.name } : {}),
+          ...(event.queue.name !== undefined ? { name: clip(event.queue.name, 512) } : {}),
           ...(event.queue.duration_ms !== undefined ? { duration_ms: event.queue.duration_ms } : {}),
         }
       : undefined;
@@ -217,17 +277,34 @@ function structureMetadataFromV1Event(
     'queue',
     'user',
     'subtenant',
+    // Blocos que o PROPRIO SDK anexa (attachCommonContext). Sem estar aqui eles caiam no ramo de objeto
+    // desconhecido: descartados E avisados via `onDroppedContextKey` — dois warnings por evento.
+    // `release` ja viaja como `service.version`; `resource` (OTel) nao cabe no `ResourceSchema` do
+    // contrato e so interessa ao transporte customizado.
+    'runtime',
+    'resource',
+    'release',
+    'performance',
   ]);
   const metaTags: Record<string, string> = {};
   for (const [k, v] of Object.entries(meta)) {
     if (RESERVED_META_KEYS.has(k)) continue;
-    if (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-      metaTags[k] = v === null ? '' : String(v);
+    if (v === null) {
+      // `null`/'' não viram tag: o `TagsSchema` exige valor não vazio, e uma tag vazia reprovava o lote.
+      continue;
+    }
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      const safe = toTagValue(k, String(v));
+      if (safe !== undefined) metaTags[k] = safe;
     } else if (typeof v === 'object' && onDroppedContextKey !== undefined) {
       onDroppedContextKey(k);
     }
   }
-  const mergedTags: Record<string, string> = { ...metaTags, ...(event.tags ?? {}) };
+  const mergedTags: Record<string, string> = {
+    ...metaTags,
+    ...performanceTags(meta.performance),
+    ...sanitizeTags(event.tags ?? {}),
+  };
 
   const metadataPayload: z.infer<typeof MetadataSchema> = {};
   if (http !== undefined) {
@@ -252,6 +329,10 @@ function structureMetadataFromV1Event(
   const subtenant = v1MetadataToSubtenant(meta);
   if (subtenant !== undefined) {
     metadataPayload.subtenant = subtenant;
+  }
+  const runtime = runtimeBlock(meta.runtime);
+  if (runtime !== undefined) {
+    metadataPayload.runtime = runtime;
   }
   if (Object.keys(mergedTags).length > 0) {
     metadataPayload.tags = mergedTags;
@@ -284,9 +365,9 @@ export function eventV1ToV4(
   const error: EventV4['error'] =
     event.type === 'error'
       ? {
-          type: typeof meta.name === 'string' && meta.name.trim() !== '' ? meta.name : 'Error',
-          message: event.message,
-          ...(typeof meta.stack === 'string' ? { stack: meta.stack } : {}),
+          type: typeof meta.name === 'string' ? (clipOptional(meta.name, 512) ?? 'Error') : 'Error',
+          message: clip(event.message, 16_000),
+          ...(typeof meta.stack === 'string' ? { stack: clip(meta.stack, 512_000) } : {}),
         }
       : undefined;
 
@@ -311,8 +392,12 @@ export function eventV1ToV4(
     timestamp: event.timestamp,
     type,
     level: event.level,
-    message: event.message,
-    service: event.service,
+    message: clip(event.message, 64_000),
+    service: {
+      name: clipOptional(event.service.name, 256) ?? 'unknown',
+      version: clip(event.service.version, 256),
+      environment: clipOptional(event.service.environment, 256) ?? 'unknown',
+    },
     trace,
     metadata,
     ...(error !== undefined ? { error } : {}),
